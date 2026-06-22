@@ -173,7 +173,7 @@ def home():
         "endpoint": "http://127.0.0.1:5000/api/market-data"
     })
 
-
+@app.route("/market-data")
 @app.route("/api/market-data")
 def market_data():
     checked_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

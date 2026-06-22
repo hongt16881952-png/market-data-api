@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+test_debug.py
+check_env.py
+test_massive.py

@@ -1196,31 +1196,21 @@ def get_coinmarketcap_usd_price(symbol):
         }
 
 
+
 def get_crypto_final_price(product_id, binance_symbol, coingecko_id, cmc_symbol):
     """
     第24个最新价格点优先级：
-    1. Coinbase ticker 真 USD 交易对
-    2. CoinGecko USD 聚合参考价
-    3. CoinMarketCap USD 最新价，如果已设置 API Key
+    1. CoinGecko USD 聚合参考价
+    2. CoinMarketCap USD 最新价，如果已设置 API Key
+    3. Coinbase ticker 真 USD 交易对
     4. Binance ticker
     5. Binance 最新完成5分钟K线 close
+
+    目的：
+    - 更接近 Google / CoinGecko / CoinMarketCap 这类综合美元参考报价
+    - Coinbase / Binance 作为备用，保证稳定性
     """
     attempts = []
-
-    coinbase_price = get_coinbase_latest_price(product_id)
-    attempts.append({
-        "source": "Coinbase",
-        "status": coinbase_price.get("status", "error")
-    })
-
-    if coinbase_price.get("status") == "ok":
-        return {
-            "status": "ok",
-            "price": coinbase_price.get("price"),
-            "source": f"Coinbase {product_id} ticker price",
-            "time_utc": coinbase_price.get("time_utc", manual()),
-            "attempts": attempts
-        }
 
     coingecko_price = get_coingecko_usd_price(coingecko_id)
     attempts.append({
@@ -1249,6 +1239,21 @@ def get_crypto_final_price(product_id, binance_symbol, coingecko_id, cmc_symbol)
             "price": cmc_price.get("price"),
             "source": "CoinMarketCap USD quote",
             "time_utc": cmc_price.get("time_utc", manual()),
+            "attempts": attempts
+        }
+
+    coinbase_price = get_coinbase_latest_price(product_id)
+    attempts.append({
+        "source": "Coinbase",
+        "status": coinbase_price.get("status", "error")
+    })
+
+    if coinbase_price.get("status") == "ok":
+        return {
+            "status": "ok",
+            "price": coinbase_price.get("price"),
+            "source": f"Coinbase {product_id} ticker price",
+            "time_utc": coinbase_price.get("time_utc", manual()),
             "attempts": attempts
         }
 
@@ -1422,10 +1427,10 @@ def get_crypto_mixed_sequence(name, product_id, binance_symbol, coingecko_id, cm
         "first_price": format_number(mixed_values[0], decimals),
         "last_price": format_number(final_close, decimals),
         "first_price_role": "sequence start price",
-        "last_price_role": "latest USD reference price from Coinbase, CoinGecko, CoinMarketCap, or Binance fallback",
+        "last_price_role": "latest USD reference price from CoinGecko, CoinMarketCap, Coinbase, or Binance fallback",
         "bar_interval": "mixed",
         "sequence_point_count": FINAL_POINTS,
-        "sequence_rule": "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses Coinbase ticker price, then CoinGecko/CoinMarketCap USD reference price, then Binance fallback",
+        "sequence_rule": "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses CoinGecko USD reference price, then CoinMarketCap, Coinbase ticker, and Binance fallback",
         "hourly_sequence_source": hourly_source,
         "final_price_source": final_price.get("source", manual()),
         "sequence_start_time_utc": sequence_start_time,
@@ -1553,10 +1558,10 @@ def build_market_data():
             "first_price": btc.get("first_price", manual()),
             "last_price": btc.get("last_price", manual()),
             "first_price_role": btc.get("first_price_role", "sequence start price"),
-            "last_price_role": btc.get("last_price_role", "latest USD reference price from Coinbase, CoinGecko, CoinMarketCap, or Binance fallback"),
+            "last_price_role": btc.get("last_price_role", "latest USD reference price from CoinGecko, CoinMarketCap, Coinbase, or Binance fallback"),
             "bar_interval": btc.get("bar_interval", "mixed"),
             "sequence_point_count": btc.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": btc.get("sequence_rule", "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses Coinbase ticker price, then CoinGecko/CoinMarketCap USD reference price, then Binance fallback"),
+            "sequence_rule": btc.get("sequence_rule", "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses CoinGecko USD reference price, then CoinMarketCap, Coinbase ticker, and Binance fallback"),
             "hourly_sequence_source": btc.get("hourly_sequence_source", manual()),
             "final_price_source": btc.get("final_price_source", manual()),
             "sequence_start_time_utc": btc.get("sequence_start_time_utc", manual()),
@@ -1577,10 +1582,10 @@ def build_market_data():
             "first_price": eth.get("first_price", manual()),
             "last_price": eth.get("last_price", manual()),
             "first_price_role": eth.get("first_price_role", "sequence start price"),
-            "last_price_role": eth.get("last_price_role", "latest USD reference price from Coinbase, CoinGecko, CoinMarketCap, or Binance fallback"),
+            "last_price_role": eth.get("last_price_role", "latest USD reference price from CoinGecko, CoinMarketCap, Coinbase, or Binance fallback"),
             "bar_interval": eth.get("bar_interval", "mixed"),
             "sequence_point_count": eth.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": eth.get("sequence_rule", "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses Coinbase ticker price, then CoinGecko/CoinMarketCap USD reference price, then Binance fallback"),
+            "sequence_rule": eth.get("sequence_rule", "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses CoinGecko USD reference price, then CoinMarketCap, Coinbase ticker, and Binance fallback"),
             "hourly_sequence_source": eth.get("hourly_sequence_source", manual()),
             "final_price_source": eth.get("final_price_source", manual()),
             "sequence_start_time_utc": eth.get("sequence_start_time_utc", manual()),
@@ -1606,10 +1611,10 @@ def build_market_data():
             "btc_source": btc.get("source", "Multi-source"),
             "eth_source": eth.get("source", "Multi-source"),
             "market_time_checked": checked_at_utc,
-            "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses Coinbase ticker, CoinGecko, CoinMarketCap, Binance ticker, then Binance 5-minute close fallback.",
+            "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses CoinGecko, CoinMarketCap, Coinbase ticker, Binance ticker, then Binance 5-minute close fallback.",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
             "global_indices_note": "Global indices are available from /global-indices as lightweight snapshots. They are not fetched inside /market-data to avoid Render timeout.",
-            "crypto_note": "BTC/USD and ETH/USD use Coinbase USD pairs first. Binance is used as a fallback for hourly sequence stability. CoinGecko and CoinMarketCap are used as latest USD reference fallbacks."
+            "crypto_note": "BTC/USD and ETH/USD use Coinbase USD hourly candles first for the first 23 points, with Binance as hourly fallback. The final latest point uses CoinGecko first, then CoinMarketCap, Coinbase, and Binance fallback."
         }
     }
 

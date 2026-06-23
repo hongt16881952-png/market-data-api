@@ -20,6 +20,7 @@ COINBASE_API_BASE = "https://api.exchange.coinbase.com"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 COINMARKETCAP_API_BASE = "https://pro-api.coinmarketcap.com/v1"
 YAHOO_API_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+YAHOO_QUOTE_API_BASE = "https://query1.finance.yahoo.com/v7/finance/quote"
 
 HOURLY_POINTS = 23
 FINAL_POINTS = 24
@@ -1660,18 +1661,19 @@ def market_data():
         }), 500
 
 
-def get_yahoo_index_snapshot(name, yahoo_symbol, decimals=2):
+def get_yahoo_quote_batch(symbol_map, timeout=6):
     """
-    轻量版全球指数概览。
-    只取最新值、前收、涨跌点数、涨跌幅。
-    不再取24个价格点，避免 /global-indices 超时或失败。
+    Yahoo Finance quote 批量轻量取数。
+    用于 /global-indices：只拿 latest / previous_close / change / change_percent。
+    symbol_map 示例：
+    {
+        "sp500": {"name": "S&P 500", "symbol": "^GSPC"}
+    }
     """
-    encoded_symbol = quote(yahoo_symbol, safe="")
-    url = f"{YAHOO_API_BASE}/{encoded_symbol}"
+    symbols = ",".join([item["symbol"] for item in symbol_map.values()])
 
     params = {
-        "interval": "1d",
-        "range": "5d"
+        "symbols": symbols
     }
 
     headers = {
@@ -1679,166 +1681,150 @@ def get_yahoo_index_snapshot(name, yahoo_symbol, decimals=2):
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=6)
+        response = requests.get(YAHOO_QUOTE_API_BASE, params=params, headers=headers, timeout=timeout)
         data = response.json()
 
-        result = data.get("chart", {}).get("result", [])
+        results = data.get("quoteResponse", {}).get("result", [])
 
-        if not result:
-            return {
-                "name": name,
-                "symbol": yahoo_symbol,
-                "source": "Yahoo Finance chart",
-                "status": "error",
-                "latest": manual(),
-                "previous_close": manual(),
-                "change": manual(),
-                "change_percent": manual(),
-                "market_time_utc": manual(),
-                "error": "No Yahoo chart result"
-            }
+        by_symbol = {}
 
-        item = result[0]
-        meta = item.get("meta", {})
+        for item in results:
+            symbol = item.get("symbol")
+            if symbol:
+                by_symbol[symbol] = item
 
-        latest = meta.get("regularMarketPrice")
-        previous_close = meta.get("previousClose")
-        market_time = meta.get("regularMarketTime")
+        output = {}
 
-        if latest is None:
-            quote_data = item.get("indicators", {}).get("quote", [])
-            timestamps = item.get("timestamp", [])
+        for key, info in symbol_map.items():
+            symbol = info["symbol"]
+            name = info["name"]
+            item = by_symbol.get(symbol, {})
 
-            if quote_data:
-                closes = quote_data[0].get("close", [])
+            latest = item.get("regularMarketPrice")
+            previous_close = item.get("regularMarketPreviousClose")
+            change = item.get("regularMarketChange")
+            change_percent = item.get("regularMarketChangePercent")
+            market_time = item.get("regularMarketTime")
 
-                valid_points = []
-
-                for timestamp, close_value in zip(timestamps, closes):
-                    if close_value is not None:
-                        valid_points.append((timestamp, close_value))
-
-                if valid_points:
-                    market_time, latest = valid_points[-1]
-
-                    if len(valid_points) >= 2 and previous_close is None:
-                        previous_close = valid_points[-2][1]
-
-        if latest is None or previous_close is None:
-            return {
-                "name": name,
-                "symbol": yahoo_symbol,
-                "source": "Yahoo Finance chart",
-                "status": "error",
-                "latest": manual(),
-                "previous_close": manual(),
-                "change": manual(),
-                "change_percent": manual(),
-                "market_time_utc": manual(),
-                "error": "Missing latest or previous close"
-            }
-
-        latest_number = float(latest)
-        previous_number = float(previous_close)
-        change = latest_number - previous_number
-
-        if previous_number != 0:
-            change_percent = (change / previous_number) * 100
-        else:
-            change_percent = 0
-
-        return {
-            "name": name,
-            "symbol": yahoo_symbol,
-            "source": "Yahoo Finance chart",
-            "status": "ok",
-            "latest": format_number(latest_number, decimals),
-            "previous_close": format_number(previous_number, decimals),
-            "change": format_number(change, decimals),
-            "change_percent": format_number(change_percent, 2),
-            "market_time_utc": utc_time_from_seconds(market_time),
-            "data_rule": "latest index snapshot from Yahoo Finance chart"
-        }
-
-    except Exception as e:
-        return {
-            "name": name,
-            "symbol": yahoo_symbol,
-            "source": "Yahoo Finance chart",
-            "status": "error",
-            "latest": manual(),
-            "previous_close": manual(),
-            "change": manual(),
-            "change_percent": manual(),
-            "market_time_utc": manual(),
-            "error": str(e)
-        }
-
-
-def get_global_indices_overview():
-    """
-    全球指数轻量概览。
-    不输出24点价格序列，只输出 latest / previous_close / change / change_percent。
-    """
-    index_map = {
-        "sp500": {
-            "name": "S&P 500",
-            "yahoo_symbol": "^GSPC"
-        },
-        "dow_jones": {
-            "name": "Dow Jones Industrial Average",
-            "yahoo_symbol": "^DJI"
-        },
-        "ftse_100": {
-            "name": "FTSE 100",
-            "yahoo_symbol": "^FTSE"
-        },
-        "nikkei_225": {
-            "name": "Nikkei 225",
-            "yahoo_symbol": "^N225"
-        },
-        "dax_40": {
-            "name": "DAX 40",
-            "yahoo_symbol": "^GDAXI"
-        },
-        "kospi": {
-            "name": "KOSPI",
-            "yahoo_symbol": "^KS11"
-        }
-    }
-
-    output = {}
-
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {}
-
-        for key, item in index_map.items():
-            future = executor.submit(
-                get_yahoo_index_snapshot,
-                item["name"],
-                item["yahoo_symbol"],
-                2
-            )
-            futures[future] = key
-
-        for future, key in futures.items():
-            try:
-                output[key] = future.result(timeout=8)
-            except Exception as e:
+            if latest is None:
                 output[key] = {
-                    "name": index_map[key]["name"],
-                    "symbol": index_map[key]["yahoo_symbol"],
-                    "source": "Yahoo Finance chart",
+                    "name": name,
+                    "symbol": symbol,
+                    "source": "Yahoo Finance quote",
                     "status": "error",
                     "latest": manual(),
                     "previous_close": manual(),
                     "change": manual(),
                     "change_percent": manual(),
                     "market_time_utc": manual(),
-                    "error": str(e)
+                    "error": "Missing regularMarketPrice"
                 }
+                continue
 
-    return output
+            try:
+                latest_number = float(latest)
+            except Exception:
+                output[key] = {
+                    "name": name,
+                    "symbol": symbol,
+                    "source": "Yahoo Finance quote",
+                    "status": "error",
+                    "latest": manual(),
+                    "previous_close": manual(),
+                    "change": manual(),
+                    "change_percent": manual(),
+                    "market_time_utc": manual(),
+                    "error": "Invalid regularMarketPrice"
+                }
+                continue
+
+            if previous_close is None and change is not None:
+                try:
+                    previous_close = latest_number - float(change)
+                except Exception:
+                    previous_close = None
+
+            if change is None and previous_close is not None:
+                try:
+                    change = latest_number - float(previous_close)
+                except Exception:
+                    change = None
+
+            if change_percent is None and previous_close not in [None, 0]:
+                try:
+                    change_percent = (float(change) / float(previous_close)) * 100
+                except Exception:
+                    change_percent = None
+
+            output[key] = {
+                "name": name,
+                "symbol": symbol,
+                "source": "Yahoo Finance quote",
+                "status": "ok",
+                "latest": format_number(latest_number, 2),
+                "previous_close": format_number(previous_close, 2) if previous_close is not None else manual(),
+                "change": format_number(change, 2) if change is not None else manual(),
+                "change_percent": format_number(change_percent, 2) if change_percent is not None else manual(),
+                "market_time_utc": utc_time_from_seconds(market_time) if market_time is not None else manual(),
+                "data_rule": "latest index snapshot from Yahoo Finance quote"
+            }
+
+        return output
+
+    except Exception as e:
+        output = {}
+
+        for key, info in symbol_map.items():
+            output[key] = {
+                "name": info["name"],
+                "symbol": info["symbol"],
+                "source": "Yahoo Finance quote",
+                "status": "error",
+                "latest": manual(),
+                "previous_close": manual(),
+                "change": manual(),
+                "change_percent": manual(),
+                "market_time_utc": manual(),
+                "error": str(e)
+            }
+
+        return output
+
+
+def get_global_indices_overview():
+    """
+    全球指数轻量概览。
+    不输出24点价格序列，只输出 latest / previous_close / change / change_percent。
+    使用 Yahoo Finance quote 批量接口，速度比逐个 chart 查询更快。
+    """
+    symbol_map = {
+        "sp500": {
+            "name": "S&P 500",
+            "symbol": "^GSPC"
+        },
+        "dow_jones": {
+            "name": "Dow Jones Industrial Average",
+            "symbol": "^DJI"
+        },
+        "ftse_100": {
+            "name": "FTSE 100",
+            "symbol": "^FTSE"
+        },
+        "nikkei_225": {
+            "name": "Nikkei 225",
+            "symbol": "^N225"
+        },
+        "dax_40": {
+            "name": "DAX 40",
+            "symbol": "^GDAXI"
+        },
+        "kospi": {
+            "name": "KOSPI",
+            "symbol": "^KS11"
+        }
+    }
+
+    return get_yahoo_quote_batch(symbol_map, timeout=6)
 
 
 
@@ -1869,9 +1855,9 @@ def global_indices_endpoint():
             "global_indices": global_indices,
             "data_rule": "global indices overview only; no 24-point price sequences",
             "data_check": {
-                "global_indices_source": "Yahoo Finance chart",
+                "global_indices_source": "Yahoo Finance quote",
                 "market_time_checked": checked_at_utc,
-                "global_indices_note": "Global indices are fetched as lightweight snapshots: latest, previous_close, change, and change_percent. This endpoint is for text market overview, not chart sequences.",
+                "global_indices_note": "Global indices are fetched as lightweight snapshots from Yahoo Finance quote: latest, previous_close, change, and change_percent. This endpoint is for text market overview, not chart sequences.",
                 "cache_seconds": CACHE_SECONDS
             },
             "cache": {

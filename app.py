@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
 MASSIVE_API_BASE = "https://api.massive.com"
-BINANCE_API_BASE = "https://api.binance.com"
+BINANCE_API_BASE = "https://data-api.binance.vision"
 
 HOURLY_POINTS = 23
 FINAL_POINTS = 24

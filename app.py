@@ -2013,6 +2013,98 @@ def get_yahoo_quote_batch(symbol_map, timeout=6):
         return output
 
 
+
+def get_global_index_focus():
+    """
+    全球指数按优先顺序取一个可用指数，节省 Twelve Data 免费额度。
+    优先顺序：
+    1. S&P 500
+    2. Dow Jones
+    3. FTSE 100
+    4. Nikkei 225
+    5. DAX 40
+    6. KOSPI
+
+    逻辑：
+    - 每个指数默认只请求 1 个 Twelve Data symbol
+    - 成功一个就立即停止，不继续请求后面的指数
+    - 正常情况只消耗 1 次 API 请求
+    - 极端情况最多消耗 6 次 API 请求
+    """
+    priority_list = [
+        {
+            "key": "sp500",
+            "name": "S&P 500",
+            "symbol": "GSPC"
+        },
+        {
+            "key": "dow_jones",
+            "name": "Dow Jones Industrial Average",
+            "symbol": "DJI"
+        },
+        {
+            "key": "ftse_100",
+            "name": "FTSE 100",
+            "symbol": "FTSE"
+        },
+        {
+            "key": "nikkei_225",
+            "name": "Nikkei 225",
+            "symbol": "N225"
+        },
+        {
+            "key": "dax_40",
+            "name": "DAX 40",
+            "symbol": "DAX"
+        },
+        {
+            "key": "kospi",
+            "name": "KOSPI",
+            "symbol": "KOSPI"
+        }
+    ]
+
+    tested_indices = []
+
+    for item in priority_list:
+        result = get_twelvedata_index_quote(
+            name=item["name"],
+            symbol_candidates=[
+                item["symbol"]
+            ],
+            decimals=2
+        )
+
+        tested_indices.append({
+            "key": item["key"],
+            "name": item["name"],
+            "symbol": item["symbol"],
+            "status": result.get("status", "error"),
+            "source": result.get("source", "Twelve Data"),
+            "reason": result.get("error", "")
+        })
+
+        if result.get("status") == "ok":
+            result["key"] = item["key"]
+            result["selection_rule"] = "selected by priority order: S&P 500, Dow Jones, FTSE 100, Nikkei 225, DAX 40, KOSPI"
+            result["tested_indices"] = tested_indices
+            return result, tested_indices
+
+    return {
+        "name": manual(),
+        "symbol": manual(),
+        "source": "Twelve Data",
+        "status": "error",
+        "latest": manual(),
+        "previous_close": manual(),
+        "change": manual(),
+        "change_percent": manual(),
+        "market_time_utc": manual(),
+        "selection_rule": "no valid index found by priority order",
+        "tested_indices": tested_indices,
+        "error": "No valid global index focus"
+    }, tested_indices
+
 def get_global_indices_overview():
     """
     全球指数轻量概览。
@@ -2086,6 +2178,7 @@ def get_global_indices_overview():
 
 
 
+
 @app.route("/api/global-indices")
 @app.route("/global-indices")
 def global_indices_endpoint():
@@ -2105,17 +2198,19 @@ def global_indices_endpoint():
 
     try:
         checked_at_utc = now_utc_text()
-        global_indices = get_global_indices_overview()
+        global_index_focus, tested_indices = get_global_index_focus()
 
         response_data = {
             "date": datetime.now().strftime("%B %d"),
             "checked_at_utc": checked_at_utc,
-            "global_indices": global_indices,
-            "data_rule": "global indices overview only; no 24-point price sequences",
+            "global_index_focus": global_index_focus,
+            "tested_indices": tested_indices,
+            "data_rule": "global index focus only; priority order; no 24-point price sequences",
             "data_check": {
-                "global_indices_source": "Twelve Data first, Yahoo Finance quote fallback",
+                "global_indices_source": "Twelve Data",
                 "market_time_checked": checked_at_utc,
-                "global_indices_note": "Global indices are fetched as lightweight snapshots. Twelve Data is used first when TWELVEDATA_API_KEY is available; Yahoo Finance quote is only a temporary fallback. This endpoint is for text market overview, not chart sequences.",
+                "selection_rule": "Try S&P 500 first. If unavailable, try Dow Jones, FTSE 100, Nikkei 225, DAX 40, then KOSPI. Stop after the first successful quote.",
+                "global_indices_note": "This endpoint is optimized for Twelve Data free limits. It returns one priority global index focus for text market overview, not six full index sequences.",
                 "cache_seconds": CACHE_SECONDS
             },
             "cache": {
@@ -2143,7 +2238,7 @@ def global_indices_endpoint():
         return jsonify({
             "status": "error",
             "error": str(e),
-            "message": "Global indices overview request failed and no cache is available."
+            "message": "Global index focus request failed and no cache is available."
         }), 500
 
 

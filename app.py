@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = Flask(**name**)
+app = Flask(__name__)
 
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
 MASSIVE_API_BASE = "https://api.massive.com"
@@ -38,7 +38,6 @@ def format_sequence(values, decimals=2, target_points=24):
 if not isinstance(values, list) or len(values) < target_points:
 return manual()
 
-```
 selected = values[-target_points:]
 result = []
 
@@ -49,7 +48,6 @@ for value in selected:
     result.append(formatted)
 
 return ",".join(result)
-```
 
 def is_flat_or_invalid_sequence(values, min_unique=3):
 """
@@ -59,7 +57,6 @@ def is_flat_or_invalid_sequence(values, min_unique=3):
 if not isinstance(values, list) or len(values) < 10:
 return True
 
-```
 rounded_values = []
 
 for value in values:
@@ -69,12 +66,11 @@ for value in values:
         return True
 
 return len(set(rounded_values)) < min_unique
-```
 
 def utc_time_from_ms(timestamp_ms):
 try:
 return datetime.fromtimestamp(
-timestamp_ms / 1000,
+int(timestamp_ms) / 1000,
 timezone.utc
 ).strftime("%Y-%m-%d %H:%M UTC")
 except Exception:
@@ -88,7 +84,6 @@ def get_reference_tickers(search_text, market="indices", limit=50):
 if not MASSIVE_API_KEY:
 return []
 
-```
 url = f"{MASSIVE_API_BASE}/v3/reference/tickers"
 
 params = {
@@ -105,14 +100,11 @@ try:
     return data.get("results", []) or []
 except Exception:
     return []
-```
 
 def get_nasdaq_composite_candidates():
 """
 目标：只使用 Nasdaq Composite 综合指数，不使用期指，不使用 Nasdaq-100。
 """
-
-```
 candidates = []
 
 results = get_reference_tickers("Nasdaq Composite", market="indices", limit=50)
@@ -149,22 +141,19 @@ for ticker in fallback:
         candidates.append(ticker)
 
 return candidates
-```
 
 def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
 """
 从 Massive 获取聚合K线。
 返回 close 数组和时间数组。
 """
-
-```
 if not MASSIVE_API_KEY:
-    return {
-        "status": "error",
-        "error": "Missing MASSIVE_API_KEY",
-        "closes": [],
-        "times": []
-    }
+return {
+"status": "error",
+"error": "Missing MASSIVE_API_KEY",
+"closes": [],
+"times": []
+}
 
 today = datetime.now(timezone.utc).date()
 start_date = today - timedelta(days=days_back)
@@ -223,7 +212,6 @@ except Exception as e:
         "closes": [],
         "times": []
     }
-```
 
 def get_massive_mixed_sequence(name, tickers, decimals=2):
 """
@@ -232,8 +220,6 @@ Massive 混合序列：
 - 最后1个点：最新可用5分钟K线 close
 - 如果5分钟不可用，则使用最近可用1小时 close
 """
-
-```
 tested = []
 
 for ticker in tickers:
@@ -307,6 +293,7 @@ for ticker in tickers:
                 final_price_source = "latest available 5-minute close"
 
     mixed_values = selected_hourly_closes + [final_close]
+
     sequence = format_sequence(
         mixed_values,
         decimals=decimals,
@@ -358,12 +345,10 @@ return {
     "sequence": manual(),
     "tested_tickers": tested
 }
-```
 
 def get_binance_klines(symbol, interval, limit=100):
 url = f"{BINANCE_API_BASE}/api/v3/klines"
 
-```
 params = {
     "symbol": symbol,
     "interval": interval,
@@ -405,7 +390,6 @@ except Exception as e:
         "error": str(e),
         "klines": []
     }
-```
 
 def get_binance_mixed_sequence(symbol, name, decimals=0):
 """
@@ -413,12 +397,10 @@ Binance 混合序列：
 - 前23个点：最近可用1小时K线 close
 - 最后1个点：最新已完成5分钟K线 close
 """
-
-```
 hourly = get_binance_klines(
-    symbol=symbol,
-    interval="1h",
-    limit=HOURLY_POINTS + 10
+symbol=symbol,
+interval="1h",
+limit=HOURLY_POINTS + 10
 )
 
 if hourly.get("status") != "ok":
@@ -513,7 +495,6 @@ return {
     "sequence_last_time_utc": utc_time_from_ms(final_time),
     "sequence": sequence
 }
-```
 
 @app.route("/")
 @app.route("/api/market-data")
@@ -522,7 +503,6 @@ def market_data():
 checked_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 today = datetime.now().strftime("%B %d")
 
-```
 gold = get_massive_mixed_sequence(
     name="Spot Gold",
     tickers=[
@@ -665,8 +645,7 @@ response_data = {
 }
 
 return jsonify(response_data)
-```
 
-if **name** == "**main**":
+ if __name__ == "__main__":
 port = int(os.environ.get("PORT", 5000))
 app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)

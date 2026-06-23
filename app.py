@@ -3,6 +3,7 @@ import copy
 import requests
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
@@ -18,6 +19,7 @@ BINANCE_API_BASE = "https://data-api.binance.vision"
 COINBASE_API_BASE = "https://api.exchange.coinbase.com"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 COINMARKETCAP_API_BASE = "https://pro-api.coinmarketcap.com/v1"
+YAHOO_API_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 
 HOURLY_POINTS = 23
 FINAL_POINTS = 24
@@ -220,14 +222,10 @@ def get_index_candidates(search_text, fallback_tickers):
 
 
 def get_global_index_candidates():
-    """
-    全球主要股票指数候选 ticker。
-    固定候选，避免每次请求都搜索 reference tickers，提高速度。
-    每个指数独立取数，互不替代。
-    """
     return {
         "sp500": {
             "name": "S&P 500",
+            "yahoo_symbol": "^GSPC",
             "tickers": [
                 "I:SPX",
                 "I:INX",
@@ -237,6 +235,7 @@ def get_global_index_candidates():
         },
         "dow_jones": {
             "name": "Dow Jones Industrial Average",
+            "yahoo_symbol": "^DJI",
             "tickers": [
                 "I:DJI",
                 "I:DJIA",
@@ -245,6 +244,7 @@ def get_global_index_candidates():
         },
         "ftse_100": {
             "name": "FTSE 100",
+            "yahoo_symbol": "^FTSE",
             "tickers": [
                 "I:UKX",
                 "I:FTSE",
@@ -253,6 +253,7 @@ def get_global_index_candidates():
         },
         "nikkei_225": {
             "name": "Nikkei 225",
+            "yahoo_symbol": "^N225",
             "tickers": [
                 "I:N225",
                 "I:NI225",
@@ -261,6 +262,7 @@ def get_global_index_candidates():
         },
         "dax_40": {
             "name": "DAX 40",
+            "yahoo_symbol": "^GDAXI",
             "tickers": [
                 "I:DAX",
                 "I:GDAXI",
@@ -269,6 +271,7 @@ def get_global_index_candidates():
         },
         "kospi": {
             "name": "KOSPI",
+            "yahoo_symbol": "^KS11",
             "tickers": [
                 "I:KOSPI",
                 "I:KS11"
@@ -277,58 +280,68 @@ def get_global_index_candidates():
     }
 
 
-def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
+def get_yahoo_chart_closes(symbol, interval="1h", range_period="14d", timeout=6):
     """
-    从 Massive 获取聚合K线。
-    返回 close 数组和时间数组。
+    Yahoo Finance chart 兜底源。
+    symbol 示例：
+    ^GSPC, ^DJI, ^FTSE, ^N225, ^GDAXI, ^KS11
     """
-    if not MASSIVE_API_KEY:
-        return {
-            "status": "error",
-            "error": "Missing MASSIVE_API_KEY",
-            "closes": [],
-            "times": []
-        }
-
-    today = datetime.now(timezone.utc).date()
-    start_date = today - timedelta(days=days_back)
-
-    url = f"{MASSIVE_API_BASE}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_date}/{today}"
+    encoded_symbol = quote(symbol, safe="")
+    url = f"{YAHOO_API_BASE}/{encoded_symbol}"
 
     params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": MASSIVE_API_KEY
+        "interval": interval,
+        "range": range_period
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 market-data-api/1.0"
     }
 
     try:
-        response = requests.get(url, params=params, timeout=6)
+        response = requests.get(url, params=params, headers=headers, timeout=timeout)
         data = response.json()
 
-        results = data.get("results")
+        result = data.get("chart", {}).get("result", [])
 
-        if not results:
+        if not result:
             return {
                 "status": "error",
-                "error": "No results",
+                "error": "No Yahoo chart result",
                 "raw": data,
                 "closes": [],
                 "times": []
             }
 
+        item = result[0]
+        timestamps = item.get("timestamp", [])
+        quote_data = item.get("indicators", {}).get("quote", [])
+
+        if not quote_data:
+            return {
+                "status": "error",
+                "error": "No Yahoo quote data",
+                "raw": data,
+                "closes": [],
+                "times": []
+            }
+
+        closes_raw = quote_data[0].get("close", [])
+
         closes = []
         times = []
 
-        for item in results:
-            if "c" in item and item["c"] is not None:
-                closes.append(item["c"])
-                times.append(item.get("t"))
+        for timestamp, close_value in zip(timestamps, closes_raw):
+            if close_value is None:
+                continue
+
+            closes.append(close_value)
+            times.append(timestamp)
 
         if not closes:
             return {
                 "status": "error",
-                "error": "No closes",
+                "error": "No valid Yahoo closes",
                 "raw": data,
                 "closes": [],
                 "times": []
@@ -337,7 +350,9 @@ def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
         return {
             "status": "ok",
             "closes": closes,
-            "times": times
+            "times": times,
+            "source": "Yahoo Finance chart",
+            "symbol": symbol
         }
 
     except Exception as e:
@@ -349,177 +364,223 @@ def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
         }
 
 
-def get_massive_mixed_sequence(name, tickers, decimals=2):
+def get_yahoo_mixed_index_sequence(name, yahoo_symbol, decimals=2):
     """
-    Massive 混合序列：
-    - 前23个点：最近可用1小时K线 close
-    - 最后1个点：最新可用5分钟K线 close
+    Yahoo global index 兜底序列：
+    - 前23个点：最近可用1小时 close
+    - 最后1个点：最新可用5分钟 close
     - 如果5分钟不可用，则使用最近可用1小时 close
     """
-    tested = []
+    hourly = get_yahoo_chart_closes(
+        symbol=yahoo_symbol,
+        interval="1h",
+        range_period="14d",
+        timeout=6
+    )
 
-    for ticker in tickers:
-        test_info = {
-            "ticker": ticker,
-            "status": "testing"
+    tested = [
+        {
+            "source": "Yahoo Finance 1-hour chart",
+            "symbol": yahoo_symbol,
+            "status": hourly.get("status", "error")
         }
-        tested.append(test_info)
+    ]
 
-        hourly = get_massive_aggs(
-            ticker=ticker,
-            multiplier=1,
-            timespan="hour",
-            days_back=14
-        )
-
-        if hourly.get("status") != "ok":
-            test_info["status"] = "error"
-            test_info["reason"] = hourly.get("error", "hourly data error")
-            continue
-
-        hourly_closes = hourly.get("closes", [])
-        hourly_times = hourly.get("times", [])
-
-        if len(hourly_closes) < HOURLY_POINTS:
-            test_info["status"] = "error"
-            test_info["reason"] = "not enough hourly bars"
-            continue
-
-        selected_hourly_closes = hourly_closes[-HOURLY_POINTS:]
-        selected_hourly_times = hourly_times[-HOURLY_POINTS:]
-
-        if is_flat_or_invalid_sequence(selected_hourly_closes):
-            test_info["status"] = "error"
-            test_info["reason"] = "flat or invalid hourly sequence"
-            test_info["raw_last_values"] = selected_hourly_closes
-            continue
-
-        five_minute = get_massive_aggs(
-            ticker=ticker,
-            multiplier=5,
-            timespan="minute",
-            days_back=14
-        )
-
-        final_close = selected_hourly_closes[-1]
-        final_time = selected_hourly_times[-1]
-        final_price_source = "hourly fallback close"
-
-        if five_minute.get("status") == "ok":
-            five_closes = five_minute.get("closes", [])
-            five_times = five_minute.get("times", [])
-
-            if five_closes and five_times:
-                candidate_close = five_closes[-1]
-                candidate_time = five_times[-1]
-
-                try:
-                    if candidate_time is not None and final_time is not None:
-                        if int(candidate_time) >= int(final_time):
-                            final_close = candidate_close
-                            final_time = candidate_time
-                            final_price_source = "latest available 5-minute close"
-                    else:
-                        final_close = candidate_close
-                        final_time = candidate_time
-                        final_price_source = "latest available 5-minute close"
-                except Exception:
-                    final_close = candidate_close
-                    final_time = candidate_time
-                    final_price_source = "latest available 5-minute close"
-
-        mixed_values = selected_hourly_closes + [final_close]
-
-        sequence = format_sequence(
-            mixed_values,
-            decimals=decimals,
-            target_points=FINAL_POINTS
-        )
-
-        if sequence == manual():
-            test_info["status"] = "error"
-            test_info["reason"] = "sequence format failed"
-            continue
-
-        test_info["status"] = "ok"
-
+    if hourly.get("status") != "ok":
         return {
             "name": name,
-            "ticker": ticker,
-            "source": "Massive",
-            "status": "ok",
-            "latest": format_number(final_close, decimals),
-            "first_price": format_number(mixed_values[0], decimals),
-            "last_price": format_number(final_close, decimals),
+            "ticker": yahoo_symbol,
+            "source": "Yahoo Finance chart",
+            "status": "error",
+            "latest": manual(),
+            "first_price": manual(),
+            "last_price": manual(),
             "first_price_role": "sequence start price",
             "last_price_role": "latest available 5-minute close or market close",
             "bar_interval": "mixed",
             "sequence_point_count": FINAL_POINTS,
             "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
-            "final_price_source": final_price_source,
-            "sequence_start_time_utc": utc_time_from_ms(selected_hourly_times[0]),
-            "sequence_hourly_last_time_utc": utc_time_from_ms(selected_hourly_times[-1]),
-            "sequence_last_time_utc": utc_time_from_ms(final_time),
-            "sequence": sequence,
-            "tested_tickers": tested
+            "final_price_source": manual(),
+            "sequence": manual(),
+            "tested_tickers": tested,
+            "error": hourly.get("error", "Yahoo hourly data error")
+        }
+
+    hourly_closes = hourly.get("closes", [])
+    hourly_times = hourly.get("times", [])
+
+    if len(hourly_closes) < HOURLY_POINTS:
+        return {
+            "name": name,
+            "ticker": yahoo_symbol,
+            "source": "Yahoo Finance chart",
+            "status": "error",
+            "latest": manual(),
+            "first_price": manual(),
+            "last_price": manual(),
+            "first_price_role": "sequence start price",
+            "last_price_role": "latest available 5-minute close or market close",
+            "bar_interval": "mixed",
+            "sequence_point_count": FINAL_POINTS,
+            "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
+            "final_price_source": manual(),
+            "sequence": manual(),
+            "tested_tickers": tested,
+            "error": "not enough Yahoo hourly closes"
+        }
+
+    selected_hourly_closes = hourly_closes[-HOURLY_POINTS:]
+    selected_hourly_times = hourly_times[-HOURLY_POINTS:]
+
+    if is_flat_or_invalid_sequence(selected_hourly_closes):
+        return {
+            "name": name,
+            "ticker": yahoo_symbol,
+            "source": "Yahoo Finance chart",
+            "status": "error",
+            "latest": manual(),
+            "first_price": manual(),
+            "last_price": manual(),
+            "first_price_role": "sequence start price",
+            "last_price_role": "latest available 5-minute close or market close",
+            "bar_interval": "mixed",
+            "sequence_point_count": FINAL_POINTS,
+            "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
+            "final_price_source": manual(),
+            "sequence": manual(),
+            "tested_tickers": tested,
+            "error": "flat or invalid Yahoo hourly sequence"
+        }
+
+    five_minute = get_yahoo_chart_closes(
+        symbol=yahoo_symbol,
+        interval="5m",
+        range_period="5d",
+        timeout=6
+    )
+
+    tested.append({
+        "source": "Yahoo Finance 5-minute chart",
+        "symbol": yahoo_symbol,
+        "status": five_minute.get("status", "error")
+    })
+
+    final_close = selected_hourly_closes[-1]
+    final_time = selected_hourly_times[-1]
+    final_price_source = "Yahoo hourly fallback close"
+
+    if five_minute.get("status") == "ok":
+        five_closes = five_minute.get("closes", [])
+        five_times = five_minute.get("times", [])
+
+        if five_closes and five_times:
+            candidate_close = five_closes[-1]
+            candidate_time = five_times[-1]
+
+            try:
+                if int(candidate_time) >= int(final_time):
+                    final_close = candidate_close
+                    final_time = candidate_time
+                    final_price_source = "Yahoo latest available 5-minute close"
+            except Exception:
+                final_close = candidate_close
+                final_time = candidate_time
+                final_price_source = "Yahoo latest available 5-minute close"
+
+    mixed_values = selected_hourly_closes + [final_close]
+
+    sequence = format_sequence(
+        mixed_values,
+        decimals=decimals,
+        target_points=FINAL_POINTS
+    )
+
+    if sequence == manual():
+        return {
+            "name": name,
+            "ticker": yahoo_symbol,
+            "source": "Yahoo Finance chart",
+            "status": "error",
+            "latest": manual(),
+            "first_price": manual(),
+            "last_price": manual(),
+            "first_price_role": "sequence start price",
+            "last_price_role": "latest available 5-minute close or market close",
+            "bar_interval": "mixed",
+            "sequence_point_count": FINAL_POINTS,
+            "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
+            "final_price_source": manual(),
+            "sequence": manual(),
+            "tested_tickers": tested,
+            "error": "Yahoo sequence format failed"
         }
 
     return {
         "name": name,
-        "ticker": manual(),
-        "source": "Massive",
-        "status": "error",
-        "latest": manual(),
-        "first_price": manual(),
-        "last_price": manual(),
+        "ticker": yahoo_symbol,
+        "source": "Yahoo Finance chart",
+        "status": "ok",
+        "latest": format_number(final_close, decimals),
+        "first_price": format_number(mixed_values[0], decimals),
+        "last_price": format_number(final_close, decimals),
         "first_price_role": "sequence start price",
         "last_price_role": "latest available 5-minute close or market close",
         "bar_interval": "mixed",
         "sequence_point_count": FINAL_POINTS,
-        "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
-        "final_price_source": manual(),
-        "sequence": manual(),
+        "sequence_rule": "first 23 points are Yahoo Finance 1-hour closes; last point is Yahoo Finance latest available 5-minute close or market close",
+        "final_price_source": final_price_source,
+        "sequence_start_time_utc": utc_time_from_seconds(selected_hourly_times[0]),
+        "sequence_hourly_last_time_utc": utc_time_from_seconds(selected_hourly_times[-1]),
+        "sequence_last_time_utc": utc_time_from_seconds(final_time),
+        "sequence": sequence,
         "tested_tickers": tested
     }
 
 
 def get_global_indices_data():
-    """
-    单独获取全球主要股票指数。
-    每个指数独立成功或失败，互不替代。
-    使用并行请求，提高 /market-data 速度。
-    """
     candidates_map = get_global_index_candidates()
     output = {}
 
     def fetch_one(key, item):
-        result = get_massive_mixed_sequence(
+        massive_result = get_massive_mixed_sequence(
             name=item.get("name", key),
             tickers=item.get("tickers", []),
             decimals=2
         )
 
-        return key, {
-            "name": item.get("name", key),
-            "symbol": result.get("ticker", manual()),
-            "unit": "Index Points",
-            "source": result.get("source", "Massive"),
-            "status": result.get("status", "error"),
-            "latest": result.get("latest", manual()),
-            "first_price": result.get("first_price", manual()),
-            "last_price": result.get("last_price", manual()),
-            "first_price_role": result.get("first_price_role", "sequence start price"),
-            "last_price_role": result.get("last_price_role", "latest available 5-minute close or market close"),
-            "bar_interval": result.get("bar_interval", "mixed"),
-            "sequence_point_count": result.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": result.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close"),
-            "final_price_source": result.get("final_price_source", manual()),
-            "sequence_start_time_utc": result.get("sequence_start_time_utc", manual()),
-            "sequence_hourly_last_time_utc": result.get("sequence_hourly_last_time_utc", manual()),
-            "sequence_last_time_utc": result.get("sequence_last_time_utc", manual()),
-            "sequence": result.get("sequence", manual()),
-            "tested_tickers": result.get("tested_tickers", [])
-        }
+        if massive_result.get("status") == "ok":
+            return key, wrap_index_result(item.get("name", key), massive_result)
+
+        yahoo_symbol = item.get("yahoo_symbol")
+
+        if yahoo_symbol:
+            yahoo_result = get_yahoo_mixed_index_sequence(
+                name=item.get("name", key),
+                yahoo_symbol=yahoo_symbol,
+                decimals=2
+            )
+
+            if yahoo_result.get("status") == "ok":
+                wrapped = wrap_index_result(item.get("name", key), yahoo_result)
+                wrapped["fallback_used"] = "Yahoo Finance chart"
+                wrapped["massive_attempt"] = massive_result.get("tested_tickers", [])
+                return key, wrapped
+
+            fallback_error = {
+                "massive_attempt": massive_result.get("tested_tickers", []),
+                "yahoo_attempt": yahoo_result.get("tested_tickers", []),
+                "yahoo_error": yahoo_result.get("error", manual())
+            }
+        else:
+            fallback_error = {
+                "massive_attempt": massive_result.get("tested_tickers", []),
+                "yahoo_error": "No Yahoo symbol configured"
+            }
+
+        wrapped_error = wrap_index_result(item.get("name", key), massive_result)
+        wrapped_error["fallback_used"] = manual()
+        wrapped_error["fallback_error"] = fallback_error
+        return key, wrapped_error
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [
@@ -529,10 +590,9 @@ def get_global_indices_data():
 
         for future in futures:
             try:
-                key, value = future.result(timeout=18)
+                key, value = future.result(timeout=22)
                 output[key] = value
             except Exception as e:
-                # 单个指数失败，不影响其它指数
                 pass
 
     ordered_output = {}
@@ -542,7 +602,7 @@ def get_global_indices_data():
             "name": item.get("name", key),
             "symbol": manual(),
             "unit": "Index Points",
-            "source": "Massive",
+            "source": "Massive / Yahoo Finance chart",
             "status": "error",
             "latest": manual(),
             "first_price": manual(),
@@ -1328,13 +1388,13 @@ def build_market_data():
         "data_check": {
             "gold_source": gold.get("source", "Massive"),
             "stocks_source": stocks_focus.get("source", "Massive"),
-            "global_indices_source": "Massive",
+            "global_indices_source": "Massive first, Yahoo Finance chart fallback",
             "btc_source": btc.get("source", "Multi-source"),
             "eth_source": eth.get("source", "Multi-source"),
             "market_time_checked": checked_at_utc,
             "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses Coinbase ticker, CoinGecko, CoinMarketCap, Binance ticker, then Binance 5-minute close fallback.",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
-            "global_indices_note": "Global indices are available from /global-indices. They are not fetched inside /market-data to avoid Render timeout.",
+            "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart as fallback. They are not fetched inside /market-data to avoid Render timeout.",
             "crypto_note": "BTC/USD and ETH/USD use Coinbase USD pairs first. Binance is used as a fallback for hourly sequence stability. CoinGecko and CoinMarketCap are used as latest USD reference fallbacks."
         }
     }
@@ -1422,9 +1482,9 @@ def global_indices_endpoint():
                 "global_indices_price_sequences": global_indices_price_sequences
             },
             "data_check": {
-                "global_indices_source": "Massive",
+                "global_indices_source": "Massive first, Yahoo Finance chart fallback",
                 "market_time_checked": checked_at_utc,
-                "global_indices_note": "Global indices are available from /global-indices. They are not fetched inside /market-data to avoid Render timeout.",
+                "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart as fallback. They are not fetched inside /market-data to avoid Render timeout.",
                 "cache_seconds": CACHE_SECONDS
             },
             "cache": {

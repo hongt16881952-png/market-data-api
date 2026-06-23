@@ -1605,7 +1605,7 @@ def build_market_data():
             "market_time_checked": checked_at_utc,
             "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses Coinbase ticker, CoinGecko, CoinMarketCap, Binance ticker, then Binance 5-minute close fallback.",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
-            "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart fallback. They are not fetched inside /market-data to avoid Render timeout.",
+            "global_indices_note": "Global indices are available from /global-indices as lightweight snapshots. They are not fetched inside /market-data to avoid Render timeout.",
             "crypto_note": "BTC/USD and ETH/USD use Coinbase USD pairs first. Binance is used as a fallback for hourly sequence stability. CoinGecko and CoinMarketCap are used as latest USD reference fallbacks."
         }
     }
@@ -1660,6 +1660,188 @@ def market_data():
         }), 500
 
 
+def get_yahoo_index_snapshot(name, yahoo_symbol, decimals=2):
+    """
+    轻量版全球指数概览。
+    只取最新值、前收、涨跌点数、涨跌幅。
+    不再取24个价格点，避免 /global-indices 超时或失败。
+    """
+    encoded_symbol = quote(yahoo_symbol, safe="")
+    url = f"{YAHOO_API_BASE}/{encoded_symbol}"
+
+    params = {
+        "interval": "1d",
+        "range": "5d"
+    }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 market-data-api/1.0"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=6)
+        data = response.json()
+
+        result = data.get("chart", {}).get("result", [])
+
+        if not result:
+            return {
+                "name": name,
+                "symbol": yahoo_symbol,
+                "source": "Yahoo Finance chart",
+                "status": "error",
+                "latest": manual(),
+                "previous_close": manual(),
+                "change": manual(),
+                "change_percent": manual(),
+                "market_time_utc": manual(),
+                "error": "No Yahoo chart result"
+            }
+
+        item = result[0]
+        meta = item.get("meta", {})
+
+        latest = meta.get("regularMarketPrice")
+        previous_close = meta.get("previousClose")
+        market_time = meta.get("regularMarketTime")
+
+        if latest is None:
+            quote_data = item.get("indicators", {}).get("quote", [])
+            timestamps = item.get("timestamp", [])
+
+            if quote_data:
+                closes = quote_data[0].get("close", [])
+
+                valid_points = []
+
+                for timestamp, close_value in zip(timestamps, closes):
+                    if close_value is not None:
+                        valid_points.append((timestamp, close_value))
+
+                if valid_points:
+                    market_time, latest = valid_points[-1]
+
+                    if len(valid_points) >= 2 and previous_close is None:
+                        previous_close = valid_points[-2][1]
+
+        if latest is None or previous_close is None:
+            return {
+                "name": name,
+                "symbol": yahoo_symbol,
+                "source": "Yahoo Finance chart",
+                "status": "error",
+                "latest": manual(),
+                "previous_close": manual(),
+                "change": manual(),
+                "change_percent": manual(),
+                "market_time_utc": manual(),
+                "error": "Missing latest or previous close"
+            }
+
+        latest_number = float(latest)
+        previous_number = float(previous_close)
+        change = latest_number - previous_number
+
+        if previous_number != 0:
+            change_percent = (change / previous_number) * 100
+        else:
+            change_percent = 0
+
+        return {
+            "name": name,
+            "symbol": yahoo_symbol,
+            "source": "Yahoo Finance chart",
+            "status": "ok",
+            "latest": format_number(latest_number, decimals),
+            "previous_close": format_number(previous_number, decimals),
+            "change": format_number(change, decimals),
+            "change_percent": format_number(change_percent, 2),
+            "market_time_utc": utc_time_from_seconds(market_time),
+            "data_rule": "latest index snapshot from Yahoo Finance chart"
+        }
+
+    except Exception as e:
+        return {
+            "name": name,
+            "symbol": yahoo_symbol,
+            "source": "Yahoo Finance chart",
+            "status": "error",
+            "latest": manual(),
+            "previous_close": manual(),
+            "change": manual(),
+            "change_percent": manual(),
+            "market_time_utc": manual(),
+            "error": str(e)
+        }
+
+
+def get_global_indices_overview():
+    """
+    全球指数轻量概览。
+    不输出24点价格序列，只输出 latest / previous_close / change / change_percent。
+    """
+    index_map = {
+        "sp500": {
+            "name": "S&P 500",
+            "yahoo_symbol": "^GSPC"
+        },
+        "dow_jones": {
+            "name": "Dow Jones Industrial Average",
+            "yahoo_symbol": "^DJI"
+        },
+        "ftse_100": {
+            "name": "FTSE 100",
+            "yahoo_symbol": "^FTSE"
+        },
+        "nikkei_225": {
+            "name": "Nikkei 225",
+            "yahoo_symbol": "^N225"
+        },
+        "dax_40": {
+            "name": "DAX 40",
+            "yahoo_symbol": "^GDAXI"
+        },
+        "kospi": {
+            "name": "KOSPI",
+            "yahoo_symbol": "^KS11"
+        }
+    }
+
+    output = {}
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {}
+
+        for key, item in index_map.items():
+            future = executor.submit(
+                get_yahoo_index_snapshot,
+                item["name"],
+                item["yahoo_symbol"],
+                2
+            )
+            futures[future] = key
+
+        for future, key in futures.items():
+            try:
+                output[key] = future.result(timeout=8)
+            except Exception as e:
+                output[key] = {
+                    "name": index_map[key]["name"],
+                    "symbol": index_map[key]["yahoo_symbol"],
+                    "source": "Yahoo Finance chart",
+                    "status": "error",
+                    "latest": manual(),
+                    "previous_close": manual(),
+                    "change": manual(),
+                    "change_percent": manual(),
+                    "market_time_utc": manual(),
+                    "error": str(e)
+                }
+
+    return output
+
+
+
 @app.route("/api/global-indices")
 @app.route("/global-indices")
 def global_indices_endpoint():
@@ -1679,23 +1861,17 @@ def global_indices_endpoint():
 
     try:
         checked_at_utc = now_utc_text()
-        global_indices = get_global_indices_data()
-        global_indices_price_sequences = {}
-
-        for key, value in global_indices.items():
-            global_indices_price_sequences[key] = value.get("sequence", manual())
+        global_indices = get_global_indices_overview()
 
         response_data = {
             "date": datetime.now().strftime("%B %d"),
             "checked_at_utc": checked_at_utc,
             "global_indices": global_indices,
-            "template": {
-                "global_indices_price_sequences": global_indices_price_sequences
-            },
+            "data_rule": "global indices overview only; no 24-point price sequences",
             "data_check": {
-                "global_indices_source": "Massive first, Yahoo Finance chart fallback",
+                "global_indices_source": "Yahoo Finance chart",
                 "market_time_checked": checked_at_utc,
-                "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart fallback. They are not fetched inside /market-data to avoid Render timeout.",
+                "global_indices_note": "Global indices are fetched as lightweight snapshots: latest, previous_close, change, and change_percent. This endpoint is for text market overview, not chart sequences.",
                 "cache_seconds": CACHE_SECONDS
             },
             "cache": {
@@ -1723,8 +1899,9 @@ def global_indices_endpoint():
         return jsonify({
             "status": "error",
             "error": str(e),
-            "message": "Global indices request failed and no cache is available."
+            "message": "Global indices overview request failed and no cache is available."
         }), 500
+
 
 
 if __name__ == "__main__":

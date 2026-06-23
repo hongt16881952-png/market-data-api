@@ -13,6 +13,7 @@ app = Flask(__name__)
 
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
 COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY", "").strip()
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
 MASSIVE_API_BASE = "https://api.massive.com"
 BINANCE_API_BASE = "https://data-api.binance.vision"
@@ -21,6 +22,7 @@ COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 COINMARKETCAP_API_BASE = "https://pro-api.coinmarketcap.com/v1"
 YAHOO_API_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 YAHOO_QUOTE_API_BASE = "https://query1.finance.yahoo.com/v7/finance/quote"
+TWELVEDATA_API_BASE = "https://api.twelvedata.com"
 
 HOURLY_POINTS = 23
 FINAL_POINTS = 24
@@ -1661,6 +1663,226 @@ def market_data():
         }), 500
 
 
+
+def get_twelvedata_index_quote(name, symbol_candidates, decimals=2):
+    """
+    Twelve Data 全球指数轻量概览。
+    需要在 Render Environment Variables 里设置：
+    TWELVEDATA_API_KEY
+
+    返回：
+    latest / previous_close / change / change_percent
+    """
+    if not TWELVEDATA_API_KEY:
+        return {
+            "name": name,
+            "symbol": manual(),
+            "source": "Twelve Data",
+            "status": "error",
+            "latest": manual(),
+            "previous_close": manual(),
+            "change": manual(),
+            "change_percent": manual(),
+            "market_time_utc": manual(),
+            "tested_symbols": [],
+            "error": "Missing TWELVEDATA_API_KEY"
+        }
+
+    tested_symbols = []
+
+    for symbol in symbol_candidates:
+        url = f"{TWELVEDATA_API_BASE}/quote"
+
+        params = {
+            "symbol": symbol,
+            "apikey": TWELVEDATA_API_KEY
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=6)
+            data = response.json()
+
+            status = data.get("status")
+            message = data.get("message") or data.get("code") or ""
+
+            if status == "error":
+                tested_symbols.append({
+                    "symbol": symbol,
+                    "status": "error",
+                    "reason": message
+                })
+                continue
+
+            latest = data.get("close") or data.get("price") or data.get("last")
+            previous_close = data.get("previous_close")
+            change = data.get("change")
+            change_percent = data.get("percent_change") or data.get("change_percent")
+            datetime_text = data.get("datetime")
+            timestamp_value = data.get("timestamp")
+
+            if latest is None:
+                tested_symbols.append({
+                    "symbol": symbol,
+                    "status": "error",
+                    "reason": "Missing latest close"
+                })
+                continue
+
+            latest_number = float(latest)
+
+            if previous_close is not None:
+                previous_number = float(previous_close)
+            elif change is not None:
+                previous_number = latest_number - float(change)
+            else:
+                previous_number = None
+
+            if change is not None:
+                change_number = float(change)
+            elif previous_number is not None:
+                change_number = latest_number - previous_number
+            else:
+                change_number = None
+
+            if change_percent is not None:
+                change_percent_number = float(change_percent)
+            elif previous_number not in [None, 0] and change_number is not None:
+                change_percent_number = (change_number / previous_number) * 100
+            else:
+                change_percent_number = None
+
+            if timestamp_value:
+                market_time_utc = utc_time_from_seconds(timestamp_value)
+            elif datetime_text:
+                market_time_utc = str(datetime_text)
+            else:
+                market_time_utc = manual()
+
+            tested_symbols.append({
+                "symbol": symbol,
+                "status": "ok"
+            })
+
+            return {
+                "name": name,
+                "symbol": symbol,
+                "source": "Twelve Data",
+                "status": "ok",
+                "latest": format_number(latest_number, decimals),
+                "previous_close": format_number(previous_number, decimals) if previous_number is not None else manual(),
+                "change": format_number(change_number, decimals) if change_number is not None else manual(),
+                "change_percent": format_number(change_percent_number, 2) if change_percent_number is not None else manual(),
+                "market_time_utc": market_time_utc,
+                "data_rule": "latest index snapshot from Twelve Data quote",
+                "tested_symbols": tested_symbols
+            }
+
+        except Exception as e:
+            tested_symbols.append({
+                "symbol": symbol,
+                "status": "error",
+                "reason": str(e)
+            })
+
+    return {
+        "name": name,
+        "symbol": manual(),
+        "source": "Twelve Data",
+        "status": "error",
+        "latest": manual(),
+        "previous_close": manual(),
+        "change": manual(),
+        "change_percent": manual(),
+        "market_time_utc": manual(),
+        "tested_symbols": tested_symbols,
+        "error": "No valid Twelve Data quote"
+    }
+
+
+def get_twelvedata_global_indices_overview():
+    """
+    Twelve Data 全球指数概览。
+    每个指数独立尝试多个候选 symbol。
+    """
+    index_map = {
+        "sp500": {
+            "name": "S&P 500",
+            "symbols": [
+                "SPX",
+                "INX",
+                "GSPC"
+            ]
+        },
+        "dow_jones": {
+            "name": "Dow Jones Industrial Average",
+            "symbols": [
+                "DJI",
+                "DJIA"
+            ]
+        },
+        "ftse_100": {
+            "name": "FTSE 100",
+            "symbols": [
+                "FTSE",
+                "UKX"
+            ]
+        },
+        "nikkei_225": {
+            "name": "Nikkei 225",
+            "symbols": [
+                "N225",
+                "NI225"
+            ]
+        },
+        "dax_40": {
+            "name": "DAX 40",
+            "symbols": [
+                "DAX",
+                "GDAXI"
+            ]
+        },
+        "kospi": {
+            "name": "KOSPI",
+            "symbols": [
+                "KS11",
+                "KOSPI"
+            ]
+        }
+    }
+
+    output = {}
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {}
+
+        for key, item in index_map.items():
+            future = executor.submit(
+                get_twelvedata_index_quote,
+                item["name"],
+                item["symbols"],
+                2
+            )
+            futures[future] = key
+
+        for future, key in futures.items():
+            try:
+                output[key] = future.result(timeout=10)
+            except Exception as e:
+                output[key] = {
+                    "name": index_map[key]["name"],
+                    "symbol": manual(),
+                    "source": "Twelve Data",
+                    "status": "error",
+                    "latest": manual(),
+                    "previous_close": manual(),
+                    "change": manual(),
+                    "change_percent": manual(),
+                    "market_time_utc": manual(),
+                    "error": str(e)
+                }
+
+    return output
+
 def get_yahoo_quote_batch(symbol_map, timeout=6):
     """
     Yahoo Finance quote 批量轻量取数。
@@ -1794,10 +2016,10 @@ def get_yahoo_quote_batch(symbol_map, timeout=6):
 def get_global_indices_overview():
     """
     全球指数轻量概览。
-    不输出24点价格序列，只输出 latest / previous_close / change / change_percent。
-    使用 Yahoo Finance quote 批量接口，速度比逐个 chart 查询更快。
+    优先 Twelve Data。
+    如果 TWELVEDATA_API_KEY 未设置或某个指数失败，则 Yahoo Finance quote 作为临时兜底。
     """
-    symbol_map = {
+    yahoo_symbol_map = {
         "sp500": {
             "name": "S&P 500",
             "symbol": "^GSPC"
@@ -1824,7 +2046,43 @@ def get_global_indices_overview():
         }
     }
 
-    return get_yahoo_quote_batch(symbol_map, timeout=6)
+    twelvedata_result = get_twelvedata_global_indices_overview()
+    yahoo_result = {}
+
+    needs_yahoo_fallback = False
+
+    for value in twelvedata_result.values():
+        if value.get("status") != "ok":
+            needs_yahoo_fallback = True
+            break
+
+    if needs_yahoo_fallback:
+        yahoo_result = get_yahoo_quote_batch(yahoo_symbol_map, timeout=6)
+
+    output = {}
+
+    for key, td_item in twelvedata_result.items():
+        if td_item.get("status") == "ok":
+            output[key] = td_item
+            continue
+
+        yahoo_item = yahoo_result.get(key)
+
+        if yahoo_item and yahoo_item.get("status") == "ok":
+            yahoo_item["fallback_used"] = "Yahoo Finance quote"
+            yahoo_item["twelvedata_attempt"] = td_item.get("tested_symbols", [])
+            output[key] = yahoo_item
+        else:
+            td_item["fallback_used"] = manual()
+
+            if yahoo_item:
+                td_item["fallback_error"] = yahoo_item.get("error", manual())
+            else:
+                td_item["fallback_error"] = "Yahoo fallback not available"
+
+            output[key] = td_item
+
+    return output
 
 
 
@@ -1855,9 +2113,9 @@ def global_indices_endpoint():
             "global_indices": global_indices,
             "data_rule": "global indices overview only; no 24-point price sequences",
             "data_check": {
-                "global_indices_source": "Yahoo Finance quote",
+                "global_indices_source": "Twelve Data first, Yahoo Finance quote fallback",
                 "market_time_checked": checked_at_utc,
-                "global_indices_note": "Global indices are fetched as lightweight snapshots from Yahoo Finance quote: latest, previous_close, change, and change_percent. This endpoint is for text market overview, not chart sequences.",
+                "global_indices_note": "Global indices are fetched as lightweight snapshots. Twelve Data is used first when TWELVEDATA_API_KEY is available; Yahoo Finance quote is only a temporary fallback. This endpoint is for text market overview, not chart sequences.",
                 "cache_seconds": CACHE_SECONDS
             },
             "cache": {

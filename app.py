@@ -28,6 +28,11 @@ CACHE = {
     "time": None
 }
 
+GLOBAL_INDICES_CACHE = {
+    "data": None,
+    "time": None
+}
+
 
 @app.after_request
 def add_cors_headers(response):
@@ -46,6 +51,8 @@ def home():
         "endpoints": [
             "/market-data",
             "/api/market-data",
+            "/global-indices",
+            "/api/global-indices",
             "/health"
         ],
         "cache_seconds": CACHE_SECONDS
@@ -1155,7 +1162,7 @@ def build_market_data():
     checked_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     today = datetime.now().strftime("%B %d")
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         future_gold = executor.submit(
             get_massive_mixed_sequence,
             "Spot Gold",
@@ -1173,8 +1180,6 @@ def build_market_data():
             get_nasdaq_composite_candidates(),
             2
         )
-
-        future_global_indices = executor.submit(get_global_indices_data)
 
         future_btc = executor.submit(
             get_crypto_mixed_sequence,
@@ -1196,12 +1201,14 @@ def build_market_data():
             2
         )
 
-        gold = future_gold.result(timeout=25)
-        stocks_focus = future_stocks_focus.result(timeout=25)
-        global_indices = future_global_indices.result(timeout=25)
-        btc = future_btc.result(timeout=25)
-        eth = future_eth.result(timeout=25)
+        gold = future_gold.result(timeout=18)
+        stocks_focus = future_stocks_focus.result(timeout=18)
+        btc = future_btc.result(timeout=18)
+        eth = future_eth.result(timeout=18)
 
+    # 为了避免 Render 免费版首次请求超时，主 /market-data 不再直接抓取 global_indices。
+    # global_indices 已拆分到 /global-indices 单独请求。
+    global_indices = {}
     global_indices_price_sequences = {}
 
     for key, value in global_indices.items():
@@ -1323,7 +1330,7 @@ def build_market_data():
             "market_time_checked": checked_at_utc,
             "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses Coinbase ticker, CoinGecko, CoinMarketCap, Binance ticker, then Binance 5-minute close fallback.",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
-            "global_indices_note": "Global indices are fetched independently: S&P 500, Dow Jones, FTSE 100, Nikkei 225, DAX 40, and KOSPI. They do not replace Nasdaq Composite.",
+            "global_indices_note": "Global indices are available from /global-indices. They are not fetched inside /market-data to avoid Render timeout.",
             "crypto_note": "BTC/USD and ETH/USD use Coinbase USD pairs first. Binance is used as a fallback for hourly sequence stability. CoinGecko and CoinMarketCap are used as latest USD reference fallbacks."
         }
     }
@@ -1375,6 +1382,73 @@ def market_data():
             "status": "error",
             "error": str(e),
             "message": "Market data request failed and no cache is available."
+        }), 500
+
+
+@app.route("/api/global-indices")
+@app.route("/global-indices")
+def global_indices_endpoint():
+    refresh = request.args.get("refresh", "").lower() in ["1", "true", "yes"]
+
+    if GLOBAL_INDICES_CACHE["data"] is not None and GLOBAL_INDICES_CACHE["time"] is not None and not refresh:
+        age = (datetime.now(timezone.utc) - GLOBAL_INDICES_CACHE["time"]).total_seconds()
+
+        if age < CACHE_SECONDS:
+            cached_data = copy.deepcopy(GLOBAL_INDICES_CACHE["data"])
+            cached_data["cache"] = {
+                "status": "hit",
+                "age_seconds": int(age),
+                "cache_seconds": CACHE_SECONDS
+            }
+            return jsonify(cached_data)
+
+    try:
+        checked_at_utc = now_utc_text()
+        global_indices = get_global_indices_data()
+        global_indices_price_sequences = {}
+
+        for key, value in global_indices.items():
+            global_indices_price_sequences[key] = value.get("sequence", manual())
+
+        response_data = {
+            "date": datetime.now().strftime("%B %d"),
+            "checked_at_utc": checked_at_utc,
+            "global_indices": global_indices,
+            "template": {
+                "global_indices_price_sequences": global_indices_price_sequences
+            },
+            "data_check": {
+                "global_indices_source": "Massive",
+                "market_time_checked": checked_at_utc,
+                "global_indices_note": "Global indices are available from /global-indices. They are not fetched inside /market-data to avoid Render timeout.",
+                "cache_seconds": CACHE_SECONDS
+            },
+            "cache": {
+                "status": "miss",
+                "age_seconds": 0,
+                "cache_seconds": CACHE_SECONDS
+            }
+        }
+
+        GLOBAL_INDICES_CACHE["data"] = copy.deepcopy(response_data)
+        GLOBAL_INDICES_CACHE["time"] = datetime.now(timezone.utc)
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        if GLOBAL_INDICES_CACHE["data"] is not None:
+            cached_data = copy.deepcopy(GLOBAL_INDICES_CACHE["data"])
+            cached_data["cache"] = {
+                "status": "stale_fallback",
+                "error": str(e),
+                "cache_seconds": CACHE_SECONDS
+            }
+            return jsonify(cached_data)
+
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "message": "Global indices request failed and no cache is available."
         }), 500
 
 

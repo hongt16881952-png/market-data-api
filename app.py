@@ -1441,27 +1441,441 @@ def get_crypto_mixed_sequence(name, product_id, binance_symbol, coingecko_id, cm
     }
 
 
+
+def get_twelvedata_time_series(symbol, interval="1h", outputsize=60, timeout=7):
+    """
+    Twelve Data time_series 通用函数。
+    用于 Gold / XAUUSD 的小时序列和5分钟兜底。
+    """
+    if not TWELVEDATA_API_KEY:
+        return {
+            "status": "error",
+            "error": "Missing TWELVEDATA_API_KEY",
+            "symbol": symbol,
+            "closes": [],
+            "times": []
+        }
+
+    url = f"{TWELVEDATA_API_BASE}/time_series"
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=timeout)
+        data = response.json()
+
+        if data.get("status") == "error":
+            return {
+                "status": "error",
+                "error": data.get("message") or data.get("code") or "Twelve Data error",
+                "raw": data,
+                "symbol": symbol,
+                "closes": [],
+                "times": []
+            }
+
+        values = data.get("values", [])
+
+        if not values:
+            return {
+                "status": "error",
+                "error": "No Twelve Data values",
+                "raw": data,
+                "symbol": symbol,
+                "closes": [],
+                "times": []
+            }
+
+        rows = []
+
+        for item in values:
+            close_value = item.get("close")
+            datetime_value = item.get("datetime")
+
+            if close_value is None or datetime_value is None:
+                continue
+
+            try:
+                close_number = float(close_value)
+            except Exception:
+                continue
+
+            rows.append({
+                "datetime": str(datetime_value),
+                "close": close_number
+            })
+
+        if not rows:
+            return {
+                "status": "error",
+                "error": "No valid Twelve Data closes",
+                "raw": data,
+                "symbol": symbol,
+                "closes": [],
+                "times": []
+            }
+
+        # Twelve Data 通常是最新在前；这里统一按时间升序排列，方便生成趋势序列。
+        rows = sorted(rows, key=lambda x: x["datetime"])
+
+        return {
+            "status": "ok",
+            "source": "Twelve Data time_series",
+            "symbol": symbol,
+            "interval": interval,
+            "closes": [row["close"] for row in rows],
+            "times": [row["datetime"] for row in rows]
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "symbol": symbol,
+            "closes": [],
+            "times": []
+        }
+
+
+def twelvedata_datetime_to_text(value):
+    if value in [None, ""]:
+        return manual()
+
+    value_text = str(value)
+
+    if "UTC" in value_text:
+        return value_text
+
+    return f"{value_text} UTC"
+
+
+def get_twelvedata_mixed_sequence(name, symbol_candidates, decimals=2):
+    """
+    Twelve Data 混合序列：
+    - 前23个点：Twelve Data 1小时 close
+    - 最后1个点：优先 Twelve Data quote 最新价
+    - 如果 quote 不可用，则使用 Twelve Data 5分钟 close
+    """
+    tested = []
+
+    for symbol in symbol_candidates:
+        hourly = get_twelvedata_time_series(
+            symbol=symbol,
+            interval="1h",
+            outputsize=HOURLY_POINTS + 30,
+            timeout=7
+        )
+
+        tested.append({
+            "source": "Twelve Data 1-hour time_series",
+            "symbol": symbol,
+            "status": hourly.get("status", "error"),
+            "reason": hourly.get("error", "")
+        })
+
+        if hourly.get("status") != "ok":
+            continue
+
+        hourly_closes = hourly.get("closes", [])
+        hourly_times = hourly.get("times", [])
+
+        if len(hourly_closes) < HOURLY_POINTS:
+            tested.append({
+                "source": "Twelve Data 1-hour time_series",
+                "symbol": symbol,
+                "status": "error",
+                "reason": "not enough hourly bars"
+            })
+            continue
+
+        selected_hourly_closes = hourly_closes[-HOURLY_POINTS:]
+        selected_hourly_times = hourly_times[-HOURLY_POINTS:]
+
+        if is_flat_or_invalid_sequence(selected_hourly_closes):
+            tested.append({
+                "source": "Twelve Data 1-hour time_series",
+                "symbol": symbol,
+                "status": "error",
+                "reason": "flat or invalid hourly sequence"
+            })
+            continue
+
+        final_close = selected_hourly_closes[-1]
+        final_time = selected_hourly_times[-1]
+        final_price_source = "Twelve Data hourly fallback close"
+
+        quote = get_twelvedata_index_quote(
+            name=name,
+            symbol_candidates=[
+                symbol
+            ],
+            decimals=decimals
+        )
+
+        tested.append({
+            "source": "Twelve Data quote",
+            "symbol": symbol,
+            "status": quote.get("status", "error"),
+            "reason": quote.get("error", "")
+        })
+
+        if quote.get("status") == "ok":
+            try:
+                final_close = float(quote.get("latest"))
+                final_time = quote.get("market_time_utc", final_time)
+                final_price_source = "Twelve Data quote latest price"
+            except Exception:
+                pass
+        else:
+            five_minute = get_twelvedata_time_series(
+                symbol=symbol,
+                interval="5min",
+                outputsize=30,
+                timeout=7
+            )
+
+            tested.append({
+                "source": "Twelve Data 5-minute time_series",
+                "symbol": symbol,
+                "status": five_minute.get("status", "error"),
+                "reason": five_minute.get("error", "")
+            })
+
+            if five_minute.get("status") == "ok":
+                five_closes = five_minute.get("closes", [])
+                five_times = five_minute.get("times", [])
+
+                if five_closes and five_times:
+                    final_close = five_closes[-1]
+                    final_time = five_times[-1]
+                    final_price_source = "Twelve Data latest available 5-minute close"
+
+        mixed_values = selected_hourly_closes + [final_close]
+
+        sequence = format_sequence(
+            mixed_values,
+            decimals=decimals,
+            target_points=FINAL_POINTS
+        )
+
+        if sequence == manual():
+            tested.append({
+                "source": "Twelve Data sequence formatter",
+                "symbol": symbol,
+                "status": "error",
+                "reason": "sequence format failed"
+            })
+            continue
+
+        return {
+            "name": name,
+            "ticker": symbol,
+            "source": "Twelve Data",
+            "status": "ok",
+            "latest": format_number(final_close, decimals),
+            "first_price": format_number(mixed_values[0], decimals),
+            "last_price": format_number(final_close, decimals),
+            "first_price_role": "sequence start price",
+            "last_price_role": "latest available quote price or 5-minute close",
+            "bar_interval": "mixed",
+            "sequence_point_count": FINAL_POINTS,
+            "sequence_rule": "first 23 points are Twelve Data 1-hour closes; last point is Twelve Data quote latest price or 5-minute close",
+            "final_price_source": final_price_source,
+            "sequence_start_time_utc": twelvedata_datetime_to_text(selected_hourly_times[0]),
+            "sequence_hourly_last_time_utc": twelvedata_datetime_to_text(selected_hourly_times[-1]),
+            "sequence_last_time_utc": twelvedata_datetime_to_text(final_time),
+            "sequence": sequence,
+            "tested_tickers": tested
+        }
+
+    return {
+        "name": name,
+        "ticker": manual(),
+        "source": "Twelve Data",
+        "status": "error",
+        "latest": manual(),
+        "first_price": manual(),
+        "last_price": manual(),
+        "first_price_role": "sequence start price",
+        "last_price_role": "latest available quote price or 5-minute close",
+        "bar_interval": "mixed",
+        "sequence_point_count": FINAL_POINTS,
+        "sequence_rule": "first 23 points are Twelve Data 1-hour closes; last point is Twelve Data quote latest price or 5-minute close",
+        "final_price_source": manual(),
+        "sequence": manual(),
+        "tested_tickers": tested,
+        "error": "No valid Twelve Data time_series for selected symbols"
+    }
+
+
+def get_gold_focus_sequence():
+    """
+    Gold / XAUUSD 数据源优先级：
+    1. Twelve Data XAU/USD
+    2. Twelve Data XAUUSD
+    3. Massive C:XAUUSD / XAUUSD / F:GC 备用
+
+    目的：让黄金最新价更接近 XAU/USD 实时综合报价。
+    """
+    twelvedata_result = get_twelvedata_mixed_sequence(
+        name="Spot Gold",
+        symbol_candidates=[
+            "XAU/USD",
+            "XAUUSD"
+        ],
+        decimals=2
+    )
+
+    if twelvedata_result.get("status") == "ok":
+        return twelvedata_result
+
+    massive_result = get_massive_mixed_sequence(
+        name="Spot Gold",
+        tickers=[
+            "C:XAUUSD",
+            "XAUUSD",
+            "F:GC"
+        ],
+        decimals=2
+    )
+
+    massive_tested = massive_result.get("tested_tickers", [])
+    massive_result["tested_tickers"] = [
+        {
+            "source": "Twelve Data gold priority source",
+            "status": twelvedata_result.get("status", "error"),
+            "reason": twelvedata_result.get("error", ""),
+            "tested_tickers": twelvedata_result.get("tested_tickers", [])
+        }
+    ] + massive_tested
+
+    if massive_result.get("status") == "ok":
+        massive_result["source"] = "Massive fallback after Twelve Data"
+        massive_result["sequence_rule"] = "Twelve Data was unavailable; fallback uses Massive hourly closes plus latest available 5-minute close"
+        return massive_result
+
+    return {
+        "name": "Spot Gold",
+        "ticker": manual(),
+        "source": "Twelve Data first, Massive fallback",
+        "status": "error",
+        "latest": manual(),
+        "first_price": manual(),
+        "last_price": manual(),
+        "first_price_role": "sequence start price",
+        "last_price_role": "latest available quote price or 5-minute close",
+        "bar_interval": "mixed",
+        "sequence_point_count": FINAL_POINTS,
+        "sequence_rule": "Twelve Data first; Massive fallback",
+        "final_price_source": manual(),
+        "sequence": manual(),
+        "tested_tickers": [
+            {
+                "source": "Twelve Data",
+                "status": twelvedata_result.get("status", "error"),
+                "reason": twelvedata_result.get("error", ""),
+                "tested_tickers": twelvedata_result.get("tested_tickers", [])
+            },
+            {
+                "source": "Massive",
+                "status": massive_result.get("status", "error"),
+                "reason": massive_result.get("error", ""),
+                "tested_tickers": massive_result.get("tested_tickers", [])
+            }
+        ],
+        "error": "Gold data unavailable from Twelve Data and Massive"
+    }
+
+
+def get_nasdaq_composite_focus_sequence():
+    """
+    Nasdaq Composite 数据源优先级：
+    1. Yahoo Finance chart ^IXIC
+    2. Massive Nasdaq Composite 候选 ticker 备用
+
+    目的：避免 Massive 免费指数数据只返回昨日收盘，导致与 Google 当前 Nasdaq Composite 明显偏离。
+    """
+    yahoo_result = get_yahoo_mixed_index_sequence(
+        name="Nasdaq Composite",
+        yahoo_symbol="^IXIC",
+        decimals=2
+    )
+
+    if yahoo_result.get("status") == "ok":
+        yahoo_result["source"] = "Yahoo Finance chart"
+        yahoo_result["sequence_rule"] = "first 23 points are Yahoo Finance ^IXIC 1-hour closes; last point is Yahoo Finance ^IXIC latest available 5-minute close or market close"
+        return yahoo_result
+
+    massive_result = get_massive_mixed_sequence(
+        name="Nasdaq Composite",
+        tickers=get_nasdaq_composite_candidates(),
+        decimals=2
+    )
+
+    massive_tested = massive_result.get("tested_tickers", [])
+    massive_result["tested_tickers"] = [
+        {
+            "source": "Yahoo Finance chart ^IXIC priority source",
+            "status": yahoo_result.get("status", "error"),
+            "reason": yahoo_result.get("error", ""),
+            "tested_tickers": yahoo_result.get("tested_tickers", [])
+        }
+    ] + massive_tested
+
+    if massive_result.get("status") == "ok":
+        massive_result["source"] = "Massive fallback after Yahoo Finance chart"
+        massive_result["sequence_rule"] = "Yahoo Finance ^IXIC was unavailable; fallback uses Massive Nasdaq Composite hourly closes plus latest available 5-minute close"
+        return massive_result
+
+    return {
+        "name": "Nasdaq Composite",
+        "ticker": manual(),
+        "source": "Yahoo Finance chart first, Massive fallback",
+        "status": "error",
+        "latest": manual(),
+        "first_price": manual(),
+        "last_price": manual(),
+        "first_price_role": "sequence start price",
+        "last_price_role": "latest available 5-minute close or market close",
+        "bar_interval": "mixed",
+        "sequence_point_count": FINAL_POINTS,
+        "sequence_rule": "Yahoo Finance ^IXIC first; Massive Nasdaq Composite fallback",
+        "final_price_source": manual(),
+        "sequence": manual(),
+        "tested_tickers": [
+            {
+                "source": "Yahoo Finance chart ^IXIC",
+                "status": yahoo_result.get("status", "error"),
+                "reason": yahoo_result.get("error", ""),
+                "tested_tickers": yahoo_result.get("tested_tickers", [])
+            },
+            {
+                "source": "Massive",
+                "status": massive_result.get("status", "error"),
+                "reason": massive_result.get("error", ""),
+                "tested_tickers": massive_result.get("tested_tickers", [])
+            }
+        ],
+        "error": "Nasdaq Composite data unavailable from Yahoo Finance chart and Massive"
+    }
+
+
 def build_market_data():
     checked_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     today = datetime.now().strftime("%B %d")
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_gold = executor.submit(
-            get_massive_mixed_sequence,
-            "Spot Gold",
-            [
-                "C:XAUUSD",
-                "XAUUSD",
-                "F:GC"
-            ],
-            2
+            get_gold_focus_sequence
         )
 
         future_stocks_focus = executor.submit(
-            get_massive_mixed_sequence,
-            "Nasdaq Composite",
-            get_nasdaq_composite_candidates(),
-            2
+            get_nasdaq_composite_focus_sequence
         )
 
         future_btc = executor.submit(
@@ -1605,14 +2019,15 @@ def build_market_data():
         },
 
         "data_check": {
-            "gold_source": gold.get("source", "Massive"),
-            "stocks_source": stocks_focus.get("source", "Massive"),
+            "gold_source": gold.get("source", "Twelve Data first, Massive fallback"),
+            "stocks_source": stocks_focus.get("source", "Yahoo Finance chart first, Massive fallback"),
             "global_indices_source": "Massive first, Yahoo Finance chart fallback",
             "btc_source": btc.get("source", "Multi-source"),
             "eth_source": eth.get("source", "Multi-source"),
             "market_time_checked": checked_at_utc,
-            "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses CoinGecko, CoinMarketCap, Coinbase ticker, Binance ticker, then Binance 5-minute close fallback.",
-            "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
+            "sequence_rule": "mixed sequence: Gold uses Twelve Data first with Massive fallback; Nasdaq Composite uses Yahoo Finance chart ^IXIC first with Massive fallback; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses CoinGecko, CoinMarketCap, Coinbase ticker, Binance ticker, then Binance 5-minute close fallback.",
+            "stocks_focus_note": "Stocks focus uses Nasdaq Composite ^IXIC via Yahoo Finance chart first; Massive Nasdaq Composite candidates are fallback only. It does not use futures and does not use Nasdaq-100.",
+            "gold_note": "Gold uses Twelve Data XAU/USD first to better match live XAU/USD reference pricing; Massive C:XAUUSD is fallback only.",
             "global_indices_note": "Global indices are available from /global-indices as lightweight snapshots. They are not fetched inside /market-data to avoid Render timeout.",
             "crypto_note": "BTC/USD and ETH/USD use Coinbase USD hourly candles first for the first 23 points, with Binance as hourly fallback. The final latest point uses CoinGecko first, then CoinMarketCap, Coinbase, and Binance fallback."
         }

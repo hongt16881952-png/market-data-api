@@ -222,6 +222,11 @@ def get_index_candidates(search_text, fallback_tickers):
 
 
 def get_global_index_candidates():
+    """
+    全球主要股票指数候选 ticker。
+    Massive 优先，Yahoo Finance chart 兜底。
+    每个指数独立取数，互不替代。
+    """
     return {
         "sp500": {
             "name": "S&P 500",
@@ -277,6 +282,212 @@ def get_global_index_candidates():
                 "I:KS11"
             ]
         }
+    }
+
+
+def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
+    """
+    从 Massive 获取聚合K线。
+    返回 close 数组和时间数组。
+    """
+    if not MASSIVE_API_KEY:
+        return {
+            "status": "error",
+            "error": "Missing MASSIVE_API_KEY",
+            "closes": [],
+            "times": []
+        }
+
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=days_back)
+
+    url = f"{MASSIVE_API_BASE}/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{start_date}/{today}"
+
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 50000,
+        "apiKey": MASSIVE_API_KEY
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=6)
+        data = response.json()
+
+        results = data.get("results")
+
+        if not results:
+            return {
+                "status": "error",
+                "error": "No results",
+                "raw": data,
+                "closes": [],
+                "times": []
+            }
+
+        closes = []
+        times = []
+
+        for item in results:
+            if "c" in item and item["c"] is not None:
+                closes.append(item["c"])
+                times.append(item.get("t"))
+
+        if not closes:
+            return {
+                "status": "error",
+                "error": "No closes",
+                "raw": data,
+                "closes": [],
+                "times": []
+            }
+
+        return {
+            "status": "ok",
+            "closes": closes,
+            "times": times
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "closes": [],
+            "times": []
+        }
+
+
+def get_massive_mixed_sequence(name, tickers, decimals=2):
+    """
+    Massive 混合序列：
+    - 前23个点：最近可用1小时K线 close
+    - 最后1个点：最新可用5分钟K线 close
+    - 如果5分钟不可用，则使用最近可用1小时 close
+    """
+    tested = []
+
+    for ticker in tickers:
+        test_info = {
+            "ticker": ticker,
+            "status": "testing"
+        }
+        tested.append(test_info)
+
+        hourly = get_massive_aggs(
+            ticker=ticker,
+            multiplier=1,
+            timespan="hour",
+            days_back=14
+        )
+
+        if hourly.get("status") != "ok":
+            test_info["status"] = "error"
+            test_info["reason"] = hourly.get("error", "hourly data error")
+            continue
+
+        hourly_closes = hourly.get("closes", [])
+        hourly_times = hourly.get("times", [])
+
+        if len(hourly_closes) < HOURLY_POINTS:
+            test_info["status"] = "error"
+            test_info["reason"] = "not enough hourly bars"
+            continue
+
+        selected_hourly_closes = hourly_closes[-HOURLY_POINTS:]
+        selected_hourly_times = hourly_times[-HOURLY_POINTS:]
+
+        if is_flat_or_invalid_sequence(selected_hourly_closes):
+            test_info["status"] = "error"
+            test_info["reason"] = "flat or invalid hourly sequence"
+            test_info["raw_last_values"] = selected_hourly_closes
+            continue
+
+        five_minute = get_massive_aggs(
+            ticker=ticker,
+            multiplier=5,
+            timespan="minute",
+            days_back=14
+        )
+
+        final_close = selected_hourly_closes[-1]
+        final_time = selected_hourly_times[-1]
+        final_price_source = "hourly fallback close"
+
+        if five_minute.get("status") == "ok":
+            five_closes = five_minute.get("closes", [])
+            five_times = five_minute.get("times", [])
+
+            if five_closes and five_times:
+                candidate_close = five_closes[-1]
+                candidate_time = five_times[-1]
+
+                try:
+                    if candidate_time is not None and final_time is not None:
+                        if int(candidate_time) >= int(final_time):
+                            final_close = candidate_close
+                            final_time = candidate_time
+                            final_price_source = "latest available 5-minute close"
+                    else:
+                        final_close = candidate_close
+                        final_time = candidate_time
+                        final_price_source = "latest available 5-minute close"
+                except Exception:
+                    final_close = candidate_close
+                    final_time = candidate_time
+                    final_price_source = "latest available 5-minute close"
+
+        mixed_values = selected_hourly_closes + [final_close]
+
+        sequence = format_sequence(
+            mixed_values,
+            decimals=decimals,
+            target_points=FINAL_POINTS
+        )
+
+        if sequence == manual():
+            test_info["status"] = "error"
+            test_info["reason"] = "sequence format failed"
+            continue
+
+        test_info["status"] = "ok"
+
+        return {
+            "name": name,
+            "ticker": ticker,
+            "source": "Massive",
+            "status": "ok",
+            "latest": format_number(final_close, decimals),
+            "first_price": format_number(mixed_values[0], decimals),
+            "last_price": format_number(final_close, decimals),
+            "first_price_role": "sequence start price",
+            "last_price_role": "latest available 5-minute close or market close",
+            "bar_interval": "mixed",
+            "sequence_point_count": FINAL_POINTS,
+            "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
+            "final_price_source": final_price_source,
+            "sequence_start_time_utc": utc_time_from_ms(selected_hourly_times[0]),
+            "sequence_hourly_last_time_utc": utc_time_from_ms(selected_hourly_times[-1]),
+            "sequence_last_time_utc": utc_time_from_ms(final_time),
+            "sequence": sequence,
+            "tested_tickers": tested
+        }
+
+    return {
+        "name": name,
+        "ticker": manual(),
+        "source": "Massive",
+        "status": "error",
+        "latest": manual(),
+        "first_price": manual(),
+        "last_price": manual(),
+        "first_price_role": "sequence start price",
+        "last_price_role": "latest available 5-minute close or market close",
+        "bar_interval": "mixed",
+        "sequence_point_count": FINAL_POINTS,
+        "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
+        "final_price_source": manual(),
+        "sequence": manual(),
+        "tested_tickers": tested
     }
 
 
@@ -592,7 +803,7 @@ def get_global_indices_data():
             try:
                 key, value = future.result(timeout=22)
                 output[key] = value
-            except Exception as e:
+            except Exception:
                 pass
 
     ordered_output = {}
@@ -1394,7 +1605,7 @@ def build_market_data():
             "market_time_checked": checked_at_utc,
             "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses Coinbase ticker, CoinGecko, CoinMarketCap, Binance ticker, then Binance 5-minute close fallback.",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
-            "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart as fallback. They are not fetched inside /market-data to avoid Render timeout.",
+            "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart fallback. They are not fetched inside /market-data to avoid Render timeout.",
             "crypto_note": "BTC/USD and ETH/USD use Coinbase USD pairs first. Binance is used as a fallback for hourly sequence stability. CoinGecko and CoinMarketCap are used as latest USD reference fallbacks."
         }
     }
@@ -1484,7 +1695,7 @@ def global_indices_endpoint():
             "data_check": {
                 "global_indices_source": "Massive first, Yahoo Finance chart fallback",
                 "market_time_checked": checked_at_utc,
-                "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart as fallback. They are not fetched inside /market-data to avoid Render timeout.",
+                "global_indices_note": "Global indices are available from /global-indices. They use Massive first and Yahoo Finance chart fallback. They are not fetched inside /market-data to avoid Render timeout.",
                 "cache_seconds": CACHE_SECONDS
             },
             "cache": {

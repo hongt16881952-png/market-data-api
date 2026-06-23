@@ -358,6 +358,10 @@ def get_massive_mixed_sequence(name, tickers, decimals=2):
 
 
 def get_binance_klines(symbol, interval, limit=100):
+    """
+    获取 Binance K线数据。
+    使用 data-api.binance.vision，不需要 API Key。
+    """
     url = f"{BINANCE_API_BASE}/api/v3/klines"
 
     params = {
@@ -403,11 +407,50 @@ def get_binance_klines(symbol, interval, limit=100):
         }
 
 
-def get_binance_mixed_sequence(symbol, name, decimals=0):
+def get_binance_latest_price(symbol):
+    """
+    获取 Binance 当前 ticker 最新价格。
+    这个价格比最新完成的5分钟K线更接近实时行情。
+    """
+    url = f"{BINANCE_API_BASE}/api/v3/ticker/price"
+
+    params = {
+        "symbol": symbol
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+
+        price = data.get("price")
+
+        if not price:
+            return {
+                "status": "error",
+                "error": "No ticker price",
+                "raw": data
+            }
+
+        return {
+            "status": "ok",
+            "price": price,
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+def get_binance_mixed_sequence(symbol, name, decimals=2):
     """
     Binance 混合序列：
     - 前23个点：最近可用1小时K线 close
-    - 最后1个点：最新已完成5分钟K线 close
+    - 最后1个点：优先使用 Binance ticker 最新价格
+    - 如果 ticker 最新价格不可用，则使用最新已完成5分钟K线 close
+    - 如果5分钟K线不可用，则使用最近1小时K线 close
     """
     hourly = get_binance_klines(
         symbol=symbol,
@@ -448,24 +491,31 @@ def get_binance_mixed_sequence(symbol, name, decimals=0):
     hourly_open_times = [item[0] for item in selected_hourly]
     hourly_close_times = [item[6] for item in selected_hourly]
 
-    five_minute = get_binance_klines(
-        symbol=symbol,
-        interval="5m",
-        limit=10
-    )
-
     final_close = hourly_closes[-1]
     final_time = hourly_close_times[-1]
     final_price_source = "hourly fallback close"
 
-    if five_minute.get("status") == "ok":
-        five_klines = five_minute.get("klines", [])
+    latest_price = get_binance_latest_price(symbol)
 
-        if five_klines:
-            latest_five = five_klines[-1]
-            final_close = latest_five[4]
-            final_time = latest_five[6]
-            final_price_source = "latest completed 5-minute close"
+    if latest_price.get("status") == "ok":
+        final_close = latest_price.get("price")
+        final_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+        final_price_source = "latest Binance ticker price"
+    else:
+        five_minute = get_binance_klines(
+            symbol=symbol,
+            interval="5m",
+            limit=10
+        )
+
+        if five_minute.get("status") == "ok":
+            five_klines = five_minute.get("klines", [])
+
+            if five_klines:
+                latest_five = five_klines[-1]
+                final_close = latest_five[4]
+                final_time = latest_five[6]
+                final_price_source = "latest completed 5-minute close"
 
     mixed_values = hourly_closes + [final_close]
 
@@ -497,10 +547,10 @@ def get_binance_mixed_sequence(symbol, name, decimals=0):
         "first_price": format_number(mixed_values[0], decimals),
         "last_price": format_number(final_close, decimals),
         "first_price_role": "sequence start price",
-        "last_price_role": "latest completed 5-minute close",
+        "last_price_role": "latest Binance ticker price, or latest completed 5-minute close when ticker price is unavailable",
         "bar_interval": "mixed",
         "sequence_point_count": FINAL_POINTS,
-        "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest completed 5-minute close",
+        "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest Binance ticker price with 5-minute close fallback",
         "final_price_source": final_price_source,
         "sequence_start_time_utc": utc_time_from_ms(hourly_open_times[0]),
         "sequence_hourly_last_time_utc": utc_time_from_ms(hourly_close_times[-1]),
@@ -537,13 +587,13 @@ def market_data():
     btc = get_binance_mixed_sequence(
         symbol="BTCUSDT",
         name="Bitcoin",
-        decimals=0
+        decimals=2
     )
 
     eth = get_binance_mixed_sequence(
         symbol="ETHUSDT",
         name="Ethereum",
-        decimals=0
+        decimals=2
     )
 
     response_data = {
@@ -568,7 +618,8 @@ def market_data():
             "sequence_start_time_utc": gold.get("sequence_start_time_utc", manual()),
             "sequence_hourly_last_time_utc": gold.get("sequence_hourly_last_time_utc", manual()),
             "sequence_last_time_utc": gold.get("sequence_last_time_utc", manual()),
-            "sequence": gold.get("sequence", manual())
+            "sequence": gold.get("sequence", manual()),
+            "tested_tickers": gold.get("tested_tickers", [])
         },
 
         "stocks_focus": {
@@ -604,10 +655,10 @@ def market_data():
             "first_price": btc.get("first_price", manual()),
             "last_price": btc.get("last_price", manual()),
             "first_price_role": btc.get("first_price_role", "sequence start price"),
-            "last_price_role": btc.get("last_price_role", "latest completed 5-minute close"),
+            "last_price_role": btc.get("last_price_role", "latest Binance ticker price, or latest completed 5-minute close when ticker price is unavailable"),
             "bar_interval": btc.get("bar_interval", "mixed"),
             "sequence_point_count": btc.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": btc.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest completed 5-minute close"),
+            "sequence_rule": btc.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest Binance ticker price with 5-minute close fallback"),
             "final_price_source": btc.get("final_price_source", manual()),
             "sequence_start_time_utc": btc.get("sequence_start_time_utc", manual()),
             "sequence_hourly_last_time_utc": btc.get("sequence_hourly_last_time_utc", manual()),
@@ -626,10 +677,10 @@ def market_data():
             "first_price": eth.get("first_price", manual()),
             "last_price": eth.get("last_price", manual()),
             "first_price_role": eth.get("first_price_role", "sequence start price"),
-            "last_price_role": eth.get("last_price_role", "latest completed 5-minute close"),
+            "last_price_role": eth.get("last_price_role", "latest Binance ticker price, or latest completed 5-minute close when ticker price is unavailable"),
             "bar_interval": eth.get("bar_interval", "mixed"),
             "sequence_point_count": eth.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": eth.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest completed 5-minute close"),
+            "sequence_rule": eth.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest Binance ticker price with 5-minute close fallback"),
             "final_price_source": eth.get("final_price_source", manual()),
             "sequence_start_time_utc": eth.get("sequence_start_time_utc", manual()),
             "sequence_hourly_last_time_utc": eth.get("sequence_hourly_last_time_utc", manual()),
@@ -651,9 +702,9 @@ def market_data():
             "btc_source": btc.get("source", "Binance"),
             "eth_source": eth.get("source", "Binance"),
             "market_time_checked": checked_at_utc,
-            "sequence_rule": "mixed sequence: first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close",
+            "sequence_rule": "mixed sequence: first 23 points are latest available 1-hour closes; crypto last point uses Binance ticker price; gold/stocks last point uses latest available 5-minute close or market close",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
-            "crypto_note": "BTC/USD and ETH/USD are sourced from Binance BTCUSDT and ETHUSDT. The last point uses the latest completed 5-minute kline close."
+            "crypto_note": "BTC/USD and ETH/USD are sourced from Binance BTCUSDT and ETHUSDT. The last point uses Binance ticker price, with latest completed 5-minute kline close as fallback."
         }
     }
 

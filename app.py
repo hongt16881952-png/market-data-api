@@ -1,7 +1,9 @@
 import os
+import copy
 import requests
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +22,12 @@ COINMARKETCAP_API_BASE = "https://pro-api.coinmarketcap.com/v1"
 HOURLY_POINTS = 23
 FINAL_POINTS = 24
 
+CACHE_SECONDS = 300
+CACHE = {
+    "data": None,
+    "time": None
+}
+
 
 @app.after_request
 def add_cors_headers(response):
@@ -27,6 +35,21 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET"
     return response
+
+
+@app.route("/")
+@app.route("/health")
+def home():
+    return jsonify({
+        "status": "ok",
+        "message": "Market data API is running.",
+        "endpoints": [
+            "/market-data",
+            "/api/market-data",
+            "/health"
+        ],
+        "cache_seconds": CACHE_SECONDS
+    })
 
 
 def manual():
@@ -116,7 +139,7 @@ def get_reference_tickers(search_text, market="indices", limit=50):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=12)
+        response = requests.get(url, params=params, timeout=6)
         data = response.json()
         return data.get("results", []) or []
     except Exception:
@@ -125,44 +148,16 @@ def get_reference_tickers(search_text, market="indices", limit=50):
 
 def get_nasdaq_composite_candidates():
     """
-    目标：只使用 Nasdaq Composite 综合指数，不使用期指，不使用 Nasdaq-100。
+    Nasdaq Composite 候选 ticker。
+    固定候选，避免每次请求都搜索 reference tickers，提高速度。
     """
-    candidates = []
-
-    results = get_reference_tickers("Nasdaq Composite", market="indices", limit=50)
-
-    for item in results:
-        ticker = item.get("ticker", "")
-        name = item.get("name", "")
-
-        ticker_upper = ticker.upper()
-        name_upper = name.upper()
-
-        if not ticker_upper.startswith("I:"):
-            continue
-
-        if "NDX" in ticker_upper:
-            continue
-
-        if "NASDAQ-100" in name_upper or "NASDAQ 100" in name_upper:
-            continue
-
-        if "NASDAQ" in name_upper and "COMPOSITE" in name_upper:
-            candidates.append(ticker)
-
-    fallback = [
+    return [
         "I:IXIC",
         "I:COMPQ",
         "I:NASCOMP",
         "I:NASDAQCOMPOSITE",
         "I:COMP"
     ]
-
-    for ticker in fallback:
-        if ticker not in candidates:
-            candidates.append(ticker)
-
-    return candidates
 
 
 def get_index_candidates(search_text, fallback_tickers):
@@ -216,80 +211,57 @@ def get_index_candidates(search_text, fallback_tickers):
 def get_global_index_candidates():
     """
     全球主要股票指数候选 ticker。
-    顺序：
-    1. S&P 500
-    2. Dow Jones
-    3. FTSE 100
-    4. Nikkei 225
-    5. DAX 40
-    6. KOSPI
+    固定候选，避免每次请求都搜索 reference tickers，提高速度。
+    每个指数独立取数，互不替代。
     """
     return {
         "sp500": {
             "name": "S&P 500",
-            "tickers": get_index_candidates(
-                "S&P 500",
-                [
-                    "I:SPX",
-                    "I:INX",
-                    "I:GSPC",
-                    "I:SP500"
-                ]
-            )
+            "tickers": [
+                "I:SPX",
+                "I:INX",
+                "I:GSPC",
+                "I:SP500"
+            ]
         },
         "dow_jones": {
             "name": "Dow Jones Industrial Average",
-            "tickers": get_index_candidates(
-                "Dow Jones Industrial Average",
-                [
-                    "I:DJI",
-                    "I:DJIA",
-                    "I:DJI30"
-                ]
-            )
+            "tickers": [
+                "I:DJI",
+                "I:DJIA",
+                "I:DJI30"
+            ]
         },
         "ftse_100": {
             "name": "FTSE 100",
-            "tickers": get_index_candidates(
-                "FTSE 100",
-                [
-                    "I:UKX",
-                    "I:FTSE",
-                    "I:FTSE100"
-                ]
-            )
+            "tickers": [
+                "I:UKX",
+                "I:FTSE",
+                "I:FTSE100"
+            ]
         },
         "nikkei_225": {
             "name": "Nikkei 225",
-            "tickers": get_index_candidates(
-                "Nikkei 225",
-                [
-                    "I:N225",
-                    "I:NI225",
-                    "I:NIKKEI225"
-                ]
-            )
+            "tickers": [
+                "I:N225",
+                "I:NI225",
+                "I:NIKKEI225"
+            ]
         },
         "dax_40": {
             "name": "DAX 40",
-            "tickers": get_index_candidates(
-                "DAX 40",
-                [
-                    "I:DAX",
-                    "I:GDAXI",
-                    "I:DAX40"
-                ]
-            )
+            "tickers": [
+                "I:DAX",
+                "I:GDAXI",
+                "I:DAX40"
+            ]
         },
         "kospi": {
             "name": "KOSPI",
-            "tickers": get_index_candidates(
-                "KOSPI",
-                [
-                    "I:KOSPI",
-                    "I:KS11"
-                ]
-            )
+            "tickers": [
+                "I:KOSPI",
+                "I:KS11"
+            ]
         }
     }
 
@@ -320,7 +292,7 @@ def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=15)
+        response = requests.get(url, params=params, timeout=6)
         data = response.json()
 
         results = data.get("results")
@@ -504,18 +476,19 @@ def get_global_indices_data():
     """
     单独获取全球主要股票指数。
     每个指数独立成功或失败，互不替代。
+    使用并行请求，提高 /market-data 速度。
     """
     candidates_map = get_global_index_candidates()
     output = {}
 
-    for key, item in candidates_map.items():
+    def fetch_one(key, item):
         result = get_massive_mixed_sequence(
             name=item.get("name", key),
             tickers=item.get("tickers", []),
             decimals=2
         )
 
-        output[key] = {
+        return key, {
             "name": item.get("name", key),
             "symbol": result.get("ticker", manual()),
             "unit": "Index Points",
@@ -537,7 +510,37 @@ def get_global_indices_data():
             "tested_tickers": result.get("tested_tickers", [])
         }
 
-    return output
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [
+            executor.submit(fetch_one, key, item)
+            for key, item in candidates_map.items()
+        ]
+
+        for future in futures:
+            try:
+                key, value = future.result(timeout=18)
+                output[key] = value
+            except Exception as e:
+                # 单个指数失败，不影响其它指数
+                pass
+
+    ordered_output = {}
+
+    for key, item in candidates_map.items():
+        ordered_output[key] = output.get(key, {
+            "name": item.get("name", key),
+            "symbol": manual(),
+            "unit": "Index Points",
+            "source": "Massive",
+            "status": "error",
+            "latest": manual(),
+            "first_price": manual(),
+            "last_price": manual(),
+            "sequence": manual(),
+            "error": "Global index request failed or timed out"
+        })
+
+    return ordered_output
 
 
 def get_coinbase_hourly_closes(product_id, target_points=23):
@@ -558,7 +561,7 @@ def get_coinbase_hourly_closes(product_id, target_points=23):
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=12)
+        response = requests.get(url, params=params, headers=headers, timeout=6)
         data = response.json()
 
         if not isinstance(data, list):
@@ -627,7 +630,7 @@ def get_coinbase_latest_price(product_id):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
         data = response.json()
 
         price = data.get("price")
@@ -669,7 +672,7 @@ def get_binance_klines(symbol, interval, limit=100):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=12)
+        response = requests.get(url, params=params, timeout=6)
         data = response.json()
 
         if not isinstance(data, list):
@@ -757,7 +760,7 @@ def get_binance_latest_price(symbol):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=5)
         data = response.json()
 
         price = data.get("price")
@@ -830,7 +833,7 @@ def get_coingecko_usd_price(coin_id):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=5)
         data = response.json()
 
         price = data.get(coin_id, {}).get("usd")
@@ -882,7 +885,7 @@ def get_coinmarketcap_usd_price(symbol):
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(url, params=params, headers=headers, timeout=5)
         data = response.json()
 
         price = data.get("data", {}).get(symbol, {}).get("quote", {}).get("USD", {}).get("price")
@@ -1148,48 +1151,56 @@ def get_crypto_mixed_sequence(name, product_id, binance_symbol, coingecko_id, cm
     }
 
 
-@app.route("/")
-@app.route("/api/market-data")
-@app.route("/market-data")
-def market_data():
+def build_market_data():
     checked_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     today = datetime.now().strftime("%B %d")
 
-    gold = get_massive_mixed_sequence(
-        name="Spot Gold",
-        tickers=[
-            "C:XAUUSD",
-            "XAUUSD",
-            "F:GC"
-        ],
-        decimals=2
-    )
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_gold = executor.submit(
+            get_massive_mixed_sequence,
+            "Spot Gold",
+            [
+                "C:XAUUSD",
+                "XAUUSD",
+                "F:GC"
+            ],
+            2
+        )
 
-    stocks_focus = get_massive_mixed_sequence(
-        name="Nasdaq Composite",
-        tickers=get_nasdaq_composite_candidates(),
-        decimals=2
-    )
+        future_stocks_focus = executor.submit(
+            get_massive_mixed_sequence,
+            "Nasdaq Composite",
+            get_nasdaq_composite_candidates(),
+            2
+        )
 
-    global_indices = get_global_indices_data()
+        future_global_indices = executor.submit(get_global_indices_data)
 
-    btc = get_crypto_mixed_sequence(
-        name="Bitcoin",
-        product_id="BTC-USD",
-        binance_symbol="BTCUSDT",
-        coingecko_id="bitcoin",
-        cmc_symbol="BTC",
-        decimals=2
-    )
+        future_btc = executor.submit(
+            get_crypto_mixed_sequence,
+            "Bitcoin",
+            "BTC-USD",
+            "BTCUSDT",
+            "bitcoin",
+            "BTC",
+            2
+        )
 
-    eth = get_crypto_mixed_sequence(
-        name="Ethereum",
-        product_id="ETH-USD",
-        binance_symbol="ETHUSDT",
-        coingecko_id="ethereum",
-        cmc_symbol="ETH",
-        decimals=2
-    )
+        future_eth = executor.submit(
+            get_crypto_mixed_sequence,
+            "Ethereum",
+            "ETH-USD",
+            "ETHUSDT",
+            "ethereum",
+            "ETH",
+            2
+        )
+
+        gold = future_gold.result(timeout=25)
+        stocks_focus = future_stocks_focus.result(timeout=25)
+        global_indices = future_global_indices.result(timeout=25)
+        btc = future_btc.result(timeout=25)
+        eth = future_eth.result(timeout=25)
 
     global_indices_price_sequences = {}
 
@@ -1317,7 +1328,54 @@ def market_data():
         }
     }
 
-    return jsonify(response_data)
+    return response_data
+
+
+@app.route("/api/market-data")
+@app.route("/market-data")
+def market_data():
+    refresh = request.args.get("refresh", "").lower() in ["1", "true", "yes"]
+
+    if CACHE["data"] is not None and CACHE["time"] is not None and not refresh:
+        age = (datetime.now(timezone.utc) - CACHE["time"]).total_seconds()
+
+        if age < CACHE_SECONDS:
+            cached_data = copy.deepcopy(CACHE["data"])
+            cached_data["cache"] = {
+                "status": "hit",
+                "age_seconds": int(age),
+                "cache_seconds": CACHE_SECONDS
+            }
+            return jsonify(cached_data)
+
+    try:
+        response_data = build_market_data()
+        response_data["cache"] = {
+            "status": "miss",
+            "age_seconds": 0,
+            "cache_seconds": CACHE_SECONDS
+        }
+
+        CACHE["data"] = copy.deepcopy(response_data)
+        CACHE["time"] = datetime.now(timezone.utc)
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        if CACHE["data"] is not None:
+            cached_data = copy.deepcopy(CACHE["data"])
+            cached_data["cache"] = {
+                "status": "stale_fallback",
+                "error": str(e),
+                "cache_seconds": CACHE_SECONDS
+            }
+            return jsonify(cached_data)
+
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "message": "Market data request failed and no cache is available."
+        }), 500
 
 
 if __name__ == "__main__":

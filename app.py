@@ -9,8 +9,13 @@ load_dotenv()
 app = Flask(__name__)
 
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "").strip()
+COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY", "").strip()
+
 MASSIVE_API_BASE = "https://api.massive.com"
 BINANCE_API_BASE = "https://data-api.binance.vision"
+COINBASE_API_BASE = "https://api.exchange.coinbase.com"
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+COINMARKETCAP_API_BASE = "https://pro-api.coinmarketcap.com/v1"
 
 HOURLY_POINTS = 23
 FINAL_POINTS = 24
@@ -83,10 +88,19 @@ def utc_time_from_ms(timestamp_ms):
         return manual()
 
 
+def utc_time_from_seconds(timestamp_seconds):
+    try:
+        return datetime.fromtimestamp(
+            int(timestamp_seconds),
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return manual()
+
+
 def get_reference_tickers(search_text, market="indices", limit=50):
     """
     从 Massive reference tickers 搜索指数 ticker。
-    用于尽量找到 Nasdaq Composite，而不是 Nasdaq futures 或 Nasdaq-100。
     """
     if not MASSIVE_API_KEY:
         return []
@@ -102,7 +116,7 @@ def get_reference_tickers(search_text, market="indices", limit=50):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=15)
+        response = requests.get(url, params=params, timeout=12)
         data = response.json()
         return data.get("results", []) or []
     except Exception:
@@ -151,6 +165,135 @@ def get_nasdaq_composite_candidates():
     return candidates
 
 
+def get_index_candidates(search_text, fallback_tickers):
+    """
+    通用指数候选 ticker 搜索函数。
+    每个指数独立取数，互不替代。
+    只接受 I: 开头的指数 ticker，避免期指。
+    """
+    candidates = []
+
+    results = get_reference_tickers(search_text, market="indices", limit=50)
+
+    normalized_search = (
+        search_text.upper()
+        .replace("&", " ")
+        .replace(".", " ")
+        .replace("-", " ")
+        .replace("  ", " ")
+    )
+    search_words = [word for word in normalized_search.split() if len(word) > 1 or word.isdigit()]
+
+    for item in results:
+        ticker = item.get("ticker", "")
+        name = item.get("name", "")
+
+        ticker_upper = ticker.upper()
+        name_upper = name.upper()
+
+        if not ticker_upper.startswith("I:"):
+            continue
+
+        if "FUTURE" in name_upper or "FUTURES" in name_upper:
+            continue
+
+        matched_count = 0
+
+        for word in search_words:
+            if word in name_upper or word in ticker_upper:
+                matched_count += 1
+
+        if matched_count >= max(1, min(2, len(search_words))):
+            candidates.append(ticker)
+
+    for ticker in fallback_tickers:
+        if ticker not in candidates:
+            candidates.append(ticker)
+
+    return candidates
+
+
+def get_global_index_candidates():
+    """
+    全球主要股票指数候选 ticker。
+    顺序：
+    1. S&P 500
+    2. Dow Jones
+    3. FTSE 100
+    4. Nikkei 225
+    5. DAX 40
+    6. KOSPI
+    """
+    return {
+        "sp500": {
+            "name": "S&P 500",
+            "tickers": get_index_candidates(
+                "S&P 500",
+                [
+                    "I:SPX",
+                    "I:INX",
+                    "I:GSPC",
+                    "I:SP500"
+                ]
+            )
+        },
+        "dow_jones": {
+            "name": "Dow Jones Industrial Average",
+            "tickers": get_index_candidates(
+                "Dow Jones Industrial Average",
+                [
+                    "I:DJI",
+                    "I:DJIA",
+                    "I:DJI30"
+                ]
+            )
+        },
+        "ftse_100": {
+            "name": "FTSE 100",
+            "tickers": get_index_candidates(
+                "FTSE 100",
+                [
+                    "I:UKX",
+                    "I:FTSE",
+                    "I:FTSE100"
+                ]
+            )
+        },
+        "nikkei_225": {
+            "name": "Nikkei 225",
+            "tickers": get_index_candidates(
+                "Nikkei 225",
+                [
+                    "I:N225",
+                    "I:NI225",
+                    "I:NIKKEI225"
+                ]
+            )
+        },
+        "dax_40": {
+            "name": "DAX 40",
+            "tickers": get_index_candidates(
+                "DAX 40",
+                [
+                    "I:DAX",
+                    "I:GDAXI",
+                    "I:DAX40"
+                ]
+            )
+        },
+        "kospi": {
+            "name": "KOSPI",
+            "tickers": get_index_candidates(
+                "KOSPI",
+                [
+                    "I:KOSPI",
+                    "I:KS11"
+                ]
+            )
+        }
+    }
+
+
 def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
     """
     从 Massive 获取聚合K线。
@@ -177,7 +320,7 @@ def get_massive_aggs(ticker, multiplier=1, timespan="hour", days_back=14):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=20)
+        response = requests.get(url, params=params, timeout=15)
         data = response.json()
 
         results = data.get("results")
@@ -357,10 +500,165 @@ def get_massive_mixed_sequence(name, tickers, decimals=2):
     }
 
 
+def get_global_indices_data():
+    """
+    单独获取全球主要股票指数。
+    每个指数独立成功或失败，互不替代。
+    """
+    candidates_map = get_global_index_candidates()
+    output = {}
+
+    for key, item in candidates_map.items():
+        result = get_massive_mixed_sequence(
+            name=item.get("name", key),
+            tickers=item.get("tickers", []),
+            decimals=2
+        )
+
+        output[key] = {
+            "name": item.get("name", key),
+            "symbol": result.get("ticker", manual()),
+            "unit": "Index Points",
+            "source": result.get("source", "Massive"),
+            "status": result.get("status", "error"),
+            "latest": result.get("latest", manual()),
+            "first_price": result.get("first_price", manual()),
+            "last_price": result.get("last_price", manual()),
+            "first_price_role": result.get("first_price_role", "sequence start price"),
+            "last_price_role": result.get("last_price_role", "latest available 5-minute close or market close"),
+            "bar_interval": result.get("bar_interval", "mixed"),
+            "sequence_point_count": result.get("sequence_point_count", FINAL_POINTS),
+            "sequence_rule": result.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest available 5-minute close or market close"),
+            "final_price_source": result.get("final_price_source", manual()),
+            "sequence_start_time_utc": result.get("sequence_start_time_utc", manual()),
+            "sequence_hourly_last_time_utc": result.get("sequence_hourly_last_time_utc", manual()),
+            "sequence_last_time_utc": result.get("sequence_last_time_utc", manual()),
+            "sequence": result.get("sequence", manual()),
+            "tested_tickers": result.get("tested_tickers", [])
+        }
+
+    return output
+
+
+def get_coinbase_hourly_closes(product_id, target_points=23):
+    """
+    Coinbase 1小时K线：
+    - product_id 示例：BTC-USD、ETH-USD
+    - candles 返回格式：[time, low, high, open, close, volume]
+    - 只使用已经完成的1小时 candle
+    """
+    url = f"{COINBASE_API_BASE}/products/{product_id}/candles"
+
+    params = {
+        "granularity": 3600
+    }
+
+    headers = {
+        "User-Agent": "market-data-api/1.0"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=12)
+        data = response.json()
+
+        if not isinstance(data, list):
+            return {
+                "status": "error",
+                "error": "Invalid Coinbase candles response",
+                "raw": data,
+                "closes": [],
+                "times": []
+            }
+
+        now_seconds = int(datetime.now(timezone.utc).timestamp())
+        completed = []
+
+        for item in data:
+            try:
+                candle_start = int(item[0])
+                candle_close_time = candle_start + 3600
+
+                if candle_close_time <= now_seconds:
+                    completed.append(item)
+            except Exception:
+                continue
+
+        completed.sort(key=lambda item: int(item[0]))
+
+        if len(completed) < target_points:
+            return {
+                "status": "error",
+                "error": "not enough completed Coinbase hourly candles",
+                "closes": [],
+                "times": []
+            }
+
+        selected = completed[-target_points:]
+        closes = [item[4] for item in selected]
+        times = [item[0] for item in selected]
+
+        return {
+            "status": "ok",
+            "closes": closes,
+            "times": times,
+            "source": "Coinbase",
+            "product_id": product_id
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "closes": [],
+            "times": []
+        }
+
+
+def get_coinbase_latest_price(product_id):
+    """
+    Coinbase 最新 ticker 价格：
+    - product_id 示例：BTC-USD、ETH-USD
+    - 返回 Coinbase 真 USD 交易对最新价格
+    """
+    url = f"{COINBASE_API_BASE}/products/{product_id}/ticker"
+
+    headers = {
+        "User-Agent": "market-data-api/1.0"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()
+
+        price = data.get("price")
+
+        if not price:
+            return {
+                "status": "error",
+                "error": "No Coinbase ticker price",
+                "raw": data
+            }
+
+        return {
+            "status": "ok",
+            "price": price,
+            "source": "Coinbase",
+            "product_id": product_id,
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
 def get_binance_klines(symbol, interval, limit=100):
     """
-    获取 Binance K线数据。
-    使用 data-api.binance.vision，不需要 API Key。
+    Binance K线数据：
+    - symbol 示例：BTCUSDT、ETHUSDT
+    - 使用 data-api.binance.vision，不需要 API Key
     """
     url = f"{BINANCE_API_BASE}/api/v3/klines"
 
@@ -371,7 +669,7 @@ def get_binance_klines(symbol, interval, limit=100):
     }
 
     try:
-        response = requests.get(url, params=params, timeout=15)
+        response = requests.get(url, params=params, timeout=12)
         data = response.json()
 
         if not isinstance(data, list):
@@ -383,7 +681,6 @@ def get_binance_klines(symbol, interval, limit=100):
             }
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
         completed_klines = []
 
         for item in data:
@@ -407,10 +704,51 @@ def get_binance_klines(symbol, interval, limit=100):
         }
 
 
+def get_binance_hourly_closes(symbol, target_points=23):
+    """
+    Binance 1小时K线兜底。
+    Coinbase 前23个点不足时，使用 Binance 1小时 close。
+    """
+    hourly = get_binance_klines(
+        symbol=symbol,
+        interval="1h",
+        limit=target_points + 20
+    )
+
+    if hourly.get("status") != "ok":
+        return {
+            "status": "error",
+            "error": hourly.get("error", "Binance hourly data error"),
+            "closes": [],
+            "times": []
+        }
+
+    klines = hourly.get("klines", [])
+
+    if len(klines) < target_points:
+        return {
+            "status": "error",
+            "error": "not enough completed Binance hourly bars",
+            "closes": [],
+            "times": []
+        }
+
+    selected = klines[-target_points:]
+    closes = [item[4] for item in selected]
+    times = [item[0] for item in selected]
+
+    return {
+        "status": "ok",
+        "closes": closes,
+        "times": times,
+        "source": "Binance",
+        "symbol": symbol
+    }
+
+
 def get_binance_latest_price(symbol):
     """
-    获取 Binance 当前 ticker 最新价格。
-    这个价格比最新完成的5分钟K线更接近实时行情。
+    Binance ticker 最新价格兜底。
     """
     url = f"{BINANCE_API_BASE}/api/v3/ticker/price"
 
@@ -427,13 +765,14 @@ def get_binance_latest_price(symbol):
         if not price:
             return {
                 "status": "error",
-                "error": "No ticker price",
+                "error": "No Binance ticker price",
                 "raw": data
             }
 
         return {
             "status": "ok",
             "price": price,
+            "source": "Binance",
             "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         }
 
@@ -444,79 +783,314 @@ def get_binance_latest_price(symbol):
         }
 
 
-def get_binance_mixed_sequence(symbol, name, decimals=2):
+def get_binance_latest_5m_close(symbol):
     """
-    Binance 混合序列：
-    - 前23个点：最近可用1小时K线 close
-    - 最后1个点：优先使用 Binance ticker 最新价格
-    - 如果 ticker 最新价格不可用，则使用最新已完成5分钟K线 close
-    - 如果5分钟K线不可用，则使用最近1小时K线 close
+    Binance 最新完成5分钟K线 close，作为最后兜底。
     """
-    hourly = get_binance_klines(
+    five_minute = get_binance_klines(
         symbol=symbol,
-        interval="1h",
-        limit=HOURLY_POINTS + 10
+        interval="5m",
+        limit=10
     )
+
+    if five_minute.get("status") != "ok":
+        return {
+            "status": "error",
+            "error": five_minute.get("error", "Binance 5m data error")
+        }
+
+    klines = five_minute.get("klines", [])
+
+    if not klines:
+        return {
+            "status": "error",
+            "error": "No completed Binance 5m candles"
+        }
+
+    latest = klines[-1]
+
+    return {
+        "status": "ok",
+        "price": latest[4],
+        "source": "Binance 5-minute close",
+        "time_ms": latest[6]
+    }
+
+
+def get_coingecko_usd_price(coin_id):
+    """
+    CoinGecko USD 聚合参考价。
+    coin_id 示例：bitcoin、ethereum
+    """
+    url = f"{COINGECKO_API_BASE}/simple/price"
+
+    params = {
+        "ids": coin_id,
+        "vs_currencies": "usd"
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+
+        price = data.get(coin_id, {}).get("usd")
+
+        if price is None:
+            return {
+                "status": "error",
+                "error": "No CoinGecko USD price",
+                "raw": data
+            }
+
+        return {
+            "status": "ok",
+            "price": price,
+            "source": "CoinGecko",
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+def get_coinmarketcap_usd_price(symbol):
+    """
+    CoinMarketCap USD 最新报价。
+    需要在 Render Environment Variables 里设置：
+    COINMARKETCAP_API_KEY
+    如果没有设置，会自动跳过，不影响程序运行。
+    """
+    if not COINMARKETCAP_API_KEY:
+        return {
+            "status": "error",
+            "error": "Missing COINMARKETCAP_API_KEY"
+        }
+
+    url = f"{COINMARKETCAP_API_BASE}/cryptocurrency/quotes/latest"
+
+    params = {
+        "symbol": symbol,
+        "convert": "USD"
+    }
+
+    headers = {
+        "X-CMC_PRO_API_KEY": COINMARKETCAP_API_KEY,
+        "Accept": "application/json"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        data = response.json()
+
+        price = data.get("data", {}).get(symbol, {}).get("quote", {}).get("USD", {}).get("price")
+
+        if price is None:
+            return {
+                "status": "error",
+                "error": "No CoinMarketCap USD price",
+                "raw": data
+            }
+
+        return {
+            "status": "ok",
+            "price": price,
+            "source": "CoinMarketCap",
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+def get_crypto_final_price(product_id, binance_symbol, coingecko_id, cmc_symbol):
+    """
+    第24个最新价格点优先级：
+    1. Coinbase ticker 真 USD 交易对
+    2. CoinGecko USD 聚合参考价
+    3. CoinMarketCap USD 最新价，如果已设置 API Key
+    4. Binance ticker
+    5. Binance 最新完成5分钟K线 close
+    """
+    attempts = []
+
+    coinbase_price = get_coinbase_latest_price(product_id)
+    attempts.append({
+        "source": "Coinbase",
+        "status": coinbase_price.get("status", "error")
+    })
+
+    if coinbase_price.get("status") == "ok":
+        return {
+            "status": "ok",
+            "price": coinbase_price.get("price"),
+            "source": f"Coinbase {product_id} ticker price",
+            "time_utc": coinbase_price.get("time_utc", manual()),
+            "attempts": attempts
+        }
+
+    coingecko_price = get_coingecko_usd_price(coingecko_id)
+    attempts.append({
+        "source": "CoinGecko",
+        "status": coingecko_price.get("status", "error")
+    })
+
+    if coingecko_price.get("status") == "ok":
+        return {
+            "status": "ok",
+            "price": coingecko_price.get("price"),
+            "source": "CoinGecko USD reference price",
+            "time_utc": coingecko_price.get("time_utc", manual()),
+            "attempts": attempts
+        }
+
+    cmc_price = get_coinmarketcap_usd_price(cmc_symbol)
+    attempts.append({
+        "source": "CoinMarketCap",
+        "status": cmc_price.get("status", "error")
+    })
+
+    if cmc_price.get("status") == "ok":
+        return {
+            "status": "ok",
+            "price": cmc_price.get("price"),
+            "source": "CoinMarketCap USD quote",
+            "time_utc": cmc_price.get("time_utc", manual()),
+            "attempts": attempts
+        }
+
+    binance_price = get_binance_latest_price(binance_symbol)
+    attempts.append({
+        "source": "Binance ticker",
+        "status": binance_price.get("status", "error")
+    })
+
+    if binance_price.get("status") == "ok":
+        return {
+            "status": "ok",
+            "price": binance_price.get("price"),
+            "source": f"Binance {binance_symbol} ticker price",
+            "time_utc": binance_price.get("time_utc", manual()),
+            "attempts": attempts
+        }
+
+    binance_5m = get_binance_latest_5m_close(binance_symbol)
+    attempts.append({
+        "source": "Binance 5-minute close",
+        "status": binance_5m.get("status", "error")
+    })
+
+    if binance_5m.get("status") == "ok":
+        return {
+            "status": "ok",
+            "price": binance_5m.get("price"),
+            "source": f"Binance {binance_symbol} latest completed 5-minute close",
+            "time_utc": utc_time_from_ms(binance_5m.get("time_ms")),
+            "attempts": attempts
+        }
+
+    return {
+        "status": "error",
+        "price": manual(),
+        "source": manual(),
+        "time_utc": manual(),
+        "attempts": attempts
+    }
+
+
+def get_crypto_mixed_sequence(name, product_id, binance_symbol, coingecko_id, cmc_symbol, decimals=2):
+    """
+    Crypto 混合序列：
+    - 前23个点：优先 Coinbase 1小时 USD candles
+    - 如果 Coinbase 前23个点不可用，使用 Binance 1小时 candles 兜底
+    - 第24个点：Coinbase ticker -> CoinGecko -> CoinMarketCap -> Binance ticker -> Binance 5m close
+    """
+    tested_sources = []
+
+    hourly = get_coinbase_hourly_closes(
+        product_id=product_id,
+        target_points=HOURLY_POINTS
+    )
+
+    tested_sources.append({
+        "source": "Coinbase hourly candles",
+        "status": hourly.get("status", "error")
+    })
+
+    hourly_source = f"Coinbase {product_id} hourly candles"
+    hourly_time_type = "seconds"
+
+    if hourly.get("status") != "ok":
+        hourly = get_binance_hourly_closes(
+            symbol=binance_symbol,
+            target_points=HOURLY_POINTS
+        )
+
+        tested_sources.append({
+            "source": "Binance hourly candles",
+            "status": hourly.get("status", "error")
+        })
+
+        hourly_source = f"Binance {binance_symbol} hourly candles"
+        hourly_time_type = "milliseconds"
 
     if hourly.get("status") != "ok":
         return {
             "name": name,
-            "symbol": symbol,
-            "source": "Binance",
             "status": "error",
+            "source": "Multi-source",
             "latest": manual(),
             "first_price": manual(),
             "last_price": manual(),
             "sequence": manual(),
-            "error": hourly.get("error", "hourly data error")
+            "tested_sources": tested_sources,
+            "error": hourly.get("error", "No valid hourly sequence")
         }
 
-    hourly_klines = hourly.get("klines", [])
+    hourly_closes = hourly.get("closes", [])
+    hourly_times = hourly.get("times", [])
 
-    if len(hourly_klines) < HOURLY_POINTS:
+    if len(hourly_closes) < HOURLY_POINTS:
         return {
             "name": name,
-            "symbol": symbol,
-            "source": "Binance",
             "status": "error",
+            "source": "Multi-source",
             "latest": manual(),
             "first_price": manual(),
             "last_price": manual(),
             "sequence": manual(),
-            "error": "not enough completed hourly bars"
+            "tested_sources": tested_sources,
+            "error": "not enough hourly closes"
         }
 
-    selected_hourly = hourly_klines[-HOURLY_POINTS:]
-    hourly_closes = [item[4] for item in selected_hourly]
-    hourly_open_times = [item[0] for item in selected_hourly]
-    hourly_close_times = [item[6] for item in selected_hourly]
+    final_price = get_crypto_final_price(
+        product_id=product_id,
+        binance_symbol=binance_symbol,
+        coingecko_id=coingecko_id,
+        cmc_symbol=cmc_symbol
+    )
 
-    final_close = hourly_closes[-1]
-    final_time = hourly_close_times[-1]
-    final_price_source = "hourly fallback close"
+    tested_sources.extend(final_price.get("attempts", []))
 
-    latest_price = get_binance_latest_price(symbol)
+    if final_price.get("status") != "ok":
+        return {
+            "name": name,
+            "status": "error",
+            "source": "Multi-source",
+            "latest": manual(),
+            "first_price": manual(),
+            "last_price": manual(),
+            "sequence": manual(),
+            "tested_sources": tested_sources,
+            "error": "No valid final price"
+        }
 
-    if latest_price.get("status") == "ok":
-        final_close = latest_price.get("price")
-        final_time = int(datetime.now(timezone.utc).timestamp() * 1000)
-        final_price_source = "latest Binance ticker price"
-    else:
-        five_minute = get_binance_klines(
-            symbol=symbol,
-            interval="5m",
-            limit=10
-        )
-
-        if five_minute.get("status") == "ok":
-            five_klines = five_minute.get("klines", [])
-
-            if five_klines:
-                latest_five = five_klines[-1]
-                final_close = latest_five[4]
-                final_time = latest_five[6]
-                final_price_source = "latest completed 5-minute close"
-
+    final_close = final_price.get("price")
     mixed_values = hourly_closes + [final_close]
 
     sequence = format_sequence(
@@ -528,34 +1102,49 @@ def get_binance_mixed_sequence(symbol, name, decimals=2):
     if sequence == manual():
         return {
             "name": name,
-            "symbol": symbol,
-            "source": "Binance",
             "status": "error",
+            "source": "Multi-source",
             "latest": manual(),
             "first_price": manual(),
             "last_price": manual(),
             "sequence": manual(),
+            "tested_sources": tested_sources,
             "error": "sequence format failed"
         }
 
+    if hourly_time_type == "seconds":
+        sequence_start_time = utc_time_from_seconds(hourly_times[0])
+        sequence_hourly_last_time = utc_time_from_seconds(hourly_times[-1])
+    else:
+        sequence_start_time = utc_time_from_ms(hourly_times[0])
+        sequence_hourly_last_time = utc_time_from_ms(hourly_times[-1])
+
     return {
         "name": name,
-        "symbol": symbol,
-        "source": "Binance",
+        "symbol": product_id,
+        "source_symbol": {
+            "coinbase": product_id,
+            "binance": binance_symbol,
+            "coingecko": coingecko_id,
+            "coinmarketcap": cmc_symbol
+        },
+        "source": "Multi-source",
         "status": "ok",
         "latest": format_number(final_close, decimals),
         "first_price": format_number(mixed_values[0], decimals),
         "last_price": format_number(final_close, decimals),
         "first_price_role": "sequence start price",
-        "last_price_role": "latest Binance ticker price, or latest completed 5-minute close when ticker price is unavailable",
+        "last_price_role": "latest USD reference price from Coinbase, CoinGecko, CoinMarketCap, or Binance fallback",
         "bar_interval": "mixed",
         "sequence_point_count": FINAL_POINTS,
-        "sequence_rule": "first 23 points are latest available 1-hour closes; last point is latest Binance ticker price with 5-minute close fallback",
-        "final_price_source": final_price_source,
-        "sequence_start_time_utc": utc_time_from_ms(hourly_open_times[0]),
-        "sequence_hourly_last_time_utc": utc_time_from_ms(hourly_close_times[-1]),
-        "sequence_last_time_utc": utc_time_from_ms(final_time),
-        "sequence": sequence
+        "sequence_rule": "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses Coinbase ticker price, then CoinGecko/CoinMarketCap USD reference price, then Binance fallback",
+        "hourly_sequence_source": hourly_source,
+        "final_price_source": final_price.get("source", manual()),
+        "sequence_start_time_utc": sequence_start_time,
+        "sequence_hourly_last_time_utc": sequence_hourly_last_time,
+        "sequence_last_time_utc": final_price.get("time_utc", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
+        "sequence": sequence,
+        "tested_sources": tested_sources
     }
 
 
@@ -576,25 +1165,36 @@ def market_data():
         decimals=2
     )
 
-    nasdaq_composite_candidates = get_nasdaq_composite_candidates()
-
     stocks_focus = get_massive_mixed_sequence(
         name="Nasdaq Composite",
-        tickers=nasdaq_composite_candidates,
+        tickers=get_nasdaq_composite_candidates(),
         decimals=2
     )
 
-    btc = get_binance_mixed_sequence(
-        symbol="BTCUSDT",
+    global_indices = get_global_indices_data()
+
+    btc = get_crypto_mixed_sequence(
         name="Bitcoin",
+        product_id="BTC-USD",
+        binance_symbol="BTCUSDT",
+        coingecko_id="bitcoin",
+        cmc_symbol="BTC",
         decimals=2
     )
 
-    eth = get_binance_mixed_sequence(
-        symbol="ETHUSDT",
+    eth = get_crypto_mixed_sequence(
         name="Ethereum",
+        product_id="ETH-USD",
+        binance_symbol="ETHUSDT",
+        coingecko_id="ethereum",
+        cmc_symbol="ETH",
         decimals=2
     )
+
+    global_indices_price_sequences = {}
+
+    for key, value in global_indices.items():
+        global_indices_price_sequences[key] = value.get("sequence", manual())
 
     response_data = {
         "date": today,
@@ -644,48 +1244,54 @@ def market_data():
             "tested_tickers": stocks_focus.get("tested_tickers", [])
         },
 
+        "global_indices": global_indices,
+
         "btc": {
             "name": "Bitcoin",
             "symbol": "BTC/USD",
-            "source_symbol": btc.get("symbol", "BTCUSDT"),
+            "source_symbol": btc.get("source_symbol", {}),
             "unit": "USD",
-            "source": btc.get("source", "Binance"),
+            "source": btc.get("source", "Multi-source"),
             "status": btc.get("status", "error"),
             "latest": btc.get("latest", manual()),
             "first_price": btc.get("first_price", manual()),
             "last_price": btc.get("last_price", manual()),
             "first_price_role": btc.get("first_price_role", "sequence start price"),
-            "last_price_role": btc.get("last_price_role", "latest Binance ticker price, or latest completed 5-minute close when ticker price is unavailable"),
+            "last_price_role": btc.get("last_price_role", "latest USD reference price from Coinbase, CoinGecko, CoinMarketCap, or Binance fallback"),
             "bar_interval": btc.get("bar_interval", "mixed"),
             "sequence_point_count": btc.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": btc.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest Binance ticker price with 5-minute close fallback"),
+            "sequence_rule": btc.get("sequence_rule", "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses Coinbase ticker price, then CoinGecko/CoinMarketCap USD reference price, then Binance fallback"),
+            "hourly_sequence_source": btc.get("hourly_sequence_source", manual()),
             "final_price_source": btc.get("final_price_source", manual()),
             "sequence_start_time_utc": btc.get("sequence_start_time_utc", manual()),
             "sequence_hourly_last_time_utc": btc.get("sequence_hourly_last_time_utc", manual()),
             "sequence_last_time_utc": btc.get("sequence_last_time_utc", manual()),
-            "sequence": btc.get("sequence", manual())
+            "sequence": btc.get("sequence", manual()),
+            "tested_sources": btc.get("tested_sources", [])
         },
 
         "eth": {
             "name": "Ethereum",
             "symbol": "ETH/USD",
-            "source_symbol": eth.get("symbol", "ETHUSDT"),
+            "source_symbol": eth.get("source_symbol", {}),
             "unit": "USD",
-            "source": eth.get("source", "Binance"),
+            "source": eth.get("source", "Multi-source"),
             "status": eth.get("status", "error"),
             "latest": eth.get("latest", manual()),
             "first_price": eth.get("first_price", manual()),
             "last_price": eth.get("last_price", manual()),
             "first_price_role": eth.get("first_price_role", "sequence start price"),
-            "last_price_role": eth.get("last_price_role", "latest Binance ticker price, or latest completed 5-minute close when ticker price is unavailable"),
+            "last_price_role": eth.get("last_price_role", "latest USD reference price from Coinbase, CoinGecko, CoinMarketCap, or Binance fallback"),
             "bar_interval": eth.get("bar_interval", "mixed"),
             "sequence_point_count": eth.get("sequence_point_count", FINAL_POINTS),
-            "sequence_rule": eth.get("sequence_rule", "first 23 points are latest available 1-hour closes; last point is latest Binance ticker price with 5-minute close fallback"),
+            "sequence_rule": eth.get("sequence_rule", "first 23 points use Coinbase 1-hour USD candles when available, otherwise Binance 1-hour closes; last point uses Coinbase ticker price, then CoinGecko/CoinMarketCap USD reference price, then Binance fallback"),
+            "hourly_sequence_source": eth.get("hourly_sequence_source", manual()),
             "final_price_source": eth.get("final_price_source", manual()),
             "sequence_start_time_utc": eth.get("sequence_start_time_utc", manual()),
             "sequence_hourly_last_time_utc": eth.get("sequence_hourly_last_time_utc", manual()),
             "sequence_last_time_utc": eth.get("sequence_last_time_utc", manual()),
-            "sequence": eth.get("sequence", manual())
+            "sequence": eth.get("sequence", manual()),
+            "tested_sources": eth.get("tested_sources", [])
         },
 
         "template": {
@@ -693,18 +1299,21 @@ def market_data():
             "gold_price_sequence": gold.get("sequence", manual()),
             "stocks_price_sequence": stocks_focus.get("sequence", manual()),
             "btc_price_sequence": btc.get("sequence", manual()),
-            "eth_price_sequence": eth.get("sequence", manual())
+            "eth_price_sequence": eth.get("sequence", manual()),
+            "global_indices_price_sequences": global_indices_price_sequences
         },
 
         "data_check": {
             "gold_source": gold.get("source", "Massive"),
             "stocks_source": stocks_focus.get("source", "Massive"),
-            "btc_source": btc.get("source", "Binance"),
-            "eth_source": eth.get("source", "Binance"),
+            "global_indices_source": "Massive",
+            "btc_source": btc.get("source", "Multi-source"),
+            "eth_source": eth.get("source", "Multi-source"),
             "market_time_checked": checked_at_utc,
-            "sequence_rule": "mixed sequence: first 23 points are latest available 1-hour closes; crypto last point uses Binance ticker price; gold/stocks last point uses latest available 5-minute close or market close",
+            "sequence_rule": "mixed sequence: first 23 points are hourly closes; crypto uses Coinbase hourly USD candles first and Binance hourly candles as fallback; crypto final point uses Coinbase ticker, CoinGecko, CoinMarketCap, Binance ticker, then Binance 5-minute close fallback.",
             "stocks_focus_note": "Stocks focus uses Nasdaq Composite index candidates only, not futures and not Nasdaq-100.",
-            "crypto_note": "BTC/USD and ETH/USD are sourced from Binance BTCUSDT and ETHUSDT. The last point uses Binance ticker price, with latest completed 5-minute kline close as fallback."
+            "global_indices_note": "Global indices are fetched independently: S&P 500, Dow Jones, FTSE 100, Nikkei 225, DAX 40, and KOSPI. They do not replace Nasdaq Composite.",
+            "crypto_note": "BTC/USD and ETH/USD use Coinbase USD pairs first. Binance is used as a fallback for hourly sequence stability. CoinGecko and CoinMarketCap are used as latest USD reference fallbacks."
         }
     }
 

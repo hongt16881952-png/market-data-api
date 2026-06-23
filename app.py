@@ -63,6 +63,10 @@ def manual():
     return "Data requires manual verification."
 
 
+def now_utc_text():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def format_number(value, decimals=2):
     try:
         number = float(value)
